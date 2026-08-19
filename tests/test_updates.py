@@ -200,9 +200,9 @@ def test_check_repo_reports_manual_update_for_baked_webui_version(tmp_path, monk
     assert info['current_sha'] == 'current-sha'
     assert info['latest_sha'] == 'stable-sha'
     assert info['compare_url'] == (
-        'https://github.com/nesquena/hermes-webui/compare/current-sha...stable-sha'
+        'https://github.com/RORHITD/amelias-webui/compare/current-sha...stable-sha'
     )
-    assert seen['url'] == 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
+    assert seen['url'] == 'https://api.github.com/repos/RORHITD/amelias-webui/tags?per_page=100'
     assert seen['timeout'] == 3.0
 
 

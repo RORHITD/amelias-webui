@@ -10007,7 +10007,7 @@ function _formatUpdateTargetStatus(label,info){
 }
 function _formatManualUpdateInstruction(info){
   if(!(info&&info.no_git&&info.manual_update&&info.behind>0)) return null;
-  return t('settings_update_manual_docker','docker pull ghcr.io/nesquena/hermes-webui:latest');
+  return t('settings_update_manual_docker','git -C /path/to/amelias-webui pull && docker compose up -d --build');
 }
 function _formatUpdateCheckError(label,info){
   if(!info||!info.error) return null;

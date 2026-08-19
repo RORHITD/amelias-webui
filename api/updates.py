@@ -823,7 +823,7 @@ def _is_stable_release_tag(tag):
     return bool(_RELEASE_TAG_RE.fullmatch(raw) and '-' not in raw[1:])
 
 
-def _github_release_tags(url='https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100', *, timeout=3.0):
+def _github_release_tags(url='https://api.github.com/repos/RORHITD/amelias-webui/tags?per_page=100', *, timeout=3.0):
     """Return GitHub release tags newest-first, including commit SHAs when available."""
     request = urllib.request.Request(
         url,
@@ -883,7 +883,7 @@ def _check_webui_published_release_update():
     current = next((item for item in tags if item['name'] == current_version), None) or {}
     current_ref = current.get('sha') or current_version
     latest_ref = latest.get('sha') or latest_version
-    repo_url = 'https://github.com/nesquena/hermes-webui'
+    repo_url = 'https://github.com/RORHITD/amelias-webui'
     return {
         'name': 'webui',
         'behind': behind,
