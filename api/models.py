@@ -6748,8 +6748,8 @@ def import_cli_session(
 
 CLAUDE_CODE_SOURCE = 'claude_code'
 CLAUDE_CODE_SOURCE_LABEL = 'Claude Code'
-CLAUDE_CODE_MAX_FILES = 200
-CLAUDE_CODE_MAX_FILE_BYTES = 10 * 1024 * 1024
+CLAUDE_CODE_MAX_FILES = 300
+CLAUDE_CODE_MAX_FILE_BYTES = 100 * 1024 * 1024
 CLAUDE_CODE_MAX_MESSAGES_PER_FILE = 1000
 CLAUDE_CODE_MAX_CONTENT_CHARS = 200_000
 
@@ -6951,27 +6951,31 @@ def _iter_claude_code_jsonl_files(projects_dir: Path | str | None = None, *, max
         root = root.resolve(strict=False)
         if not root.exists() or not root.is_dir():
             return
-        yielded = 0
-        for project_dir in sorted(root.iterdir(), key=lambda p: p.name):
-            if yielded >= max_files:
-                return
+        # Collect every candidate with its mtime, then yield the NEWEST
+        # ``max_files``. The previous alphabetical walk made the cap select an
+        # essentially arbitrary subset on installs with thousands of
+        # transcripts, so a session from five minutes ago could be invisible
+        # while a year-old one showed (#sidebar-missing-sessions).
+        candidates: list[tuple[float, Path]] = []
+        for project_dir in root.iterdir():
             try:
                 if project_dir.is_symlink() or not project_dir.is_dir():
                     continue
-                for path in sorted(project_dir.iterdir(), key=lambda p: p.name):
-                    if yielded >= max_files:
-                        return
+                for path in project_dir.iterdir():
                     if path.is_symlink() or not path.is_file() or path.suffix.lower() != '.jsonl':
                         continue
                     try:
-                        if path.stat().st_size > max_file_bytes:
-                            continue
+                        st = path.stat()
                     except OSError:
                         continue
-                    yielded += 1
-                    yield path
+                    if st.st_size > max_file_bytes:
+                        continue
+                    candidates.append((st.st_mtime, path))
             except OSError:
                 continue
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        for _mtime, path in candidates[:max_files]:
+            yield path
     except OSError:
         return
 
