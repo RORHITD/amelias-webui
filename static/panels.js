@@ -2428,7 +2428,23 @@ function _kanbanCardStalenessClass(task){
   return '';
 }
 
+// Session cards are projections of a live transcript, not rows in the task DB.
+// Every mutating affordance has to be withheld from them: there is nothing to
+// PATCH, so a drag, a Complete or an Archive would just 400.
+function _kanbanTaskIsDerived(task){
+  return !!(task && (task.derived || task.read_only || String(task.id || '').startsWith('session:')));
+}
+
+function openKanbanSessionCard(event, sessionId){
+  if (event) event.stopPropagation();
+  if (!sessionId) return false;
+  try { if (typeof closeKanban === 'function') closeKanban(); } catch(_) {}
+  try { loadSession(sessionId); } catch(_) {}
+  return false;
+}
+
 function _kanbanCardQuickActions(task){
+  if (_kanbanTaskIsDerived(task)) return '';
   const id = esc(task.id || '');
   const status = task.status || '';
   const complete = status !== 'done' && status !== 'archived' ? `<button type="button" class="kanban-card-action" onclick="quickKanbanCardAction(event,'${id}','done')">${esc(t('kanban_card_complete'))}</button>` : '';
@@ -2583,12 +2599,30 @@ function _kanbanCard(task, status){
   const stale = _kanbanCardStalenessClass(task);
   const body = _kanbanTaskBody(task);
   const assignee = task.assignee ? `<span class="kanban-card-assignee">@${esc(task.assignee)}</span>` : `<span class="kanban-card-unassigned">${esc(t('kanban_unassigned'))}</span>`;
+  if (_kanbanTaskIsDerived(task)) return _kanbanSessionCard(task, body, age, stale);
   return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, '${esc(task.id)}')" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, '${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
     <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant">${esc(task.tenant)}</span>` : ''}</div>
     <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
     ${body ? `<div class="kanban-card-body">${_kanbanRenderMarkdown(body)}</div>` : ''}
     <div class="kanban-card-meta">${assignee}${comments ? `<span class="kanban-card-metric">💬 ${comments}</span>` : ''}${linkTotal ? `<span class="kanban-card-metric">↔ ${linkTotal}</span>` : ''}${age ? `<span class="kanban-card-age">${esc(age)}</span>` : ''}</div>
     ${_kanbanCardQuickActions(task)}
+  </article>`;
+}
+
+// Defined after _kanbanCard on purpose: the draggable task template must stay
+// the first card template in this file, since that is what the drag/drop
+// regression test anchors on.
+function _kanbanSessionCard(task, body, age, stale){
+  const sid = esc(task.session_id || '');
+  const msgs = Number(task.message_count || 0);
+  const branch = task.branch_name ? `<span class="kanban-badge tenant">${esc(task.branch_name)}</span>` : '';
+  // No draggable/ondragstart here: there is no task row behind this card, so a
+  // drop would PATCH an id the task DB has never seen.
+  return `<article class="kanban-card kanban-card-session ${esc(stale)}" data-kanban-session-id="${sid}" onclick="return openKanbanSessionCard(event, '${sid}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openKanbanSessionCard(event,'${sid}')}">
+    <div class="kanban-card-topline"><span class="kanban-card-id">${esc(t('kanban_card_session'))}</span>${branch}</div>
+    <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
+    ${body ? `<div class="kanban-card-body kanban-card-question">${_kanbanRenderMarkdown(body)}</div>` : ''}
+    <div class="kanban-card-meta">${msgs ? `<span class="kanban-card-metric">${msgs} msgs</span>` : ''}${age ? `<span class="kanban-card-age">${esc(age)}</span>` : ''}</div>
   </article>`;
 }
 
@@ -4868,7 +4902,52 @@ async function loadSkills() {
     const liveCats = new Set(_skillsData.map(s => s.category || '(general)'));
     for (const c of _collapsedCats) { if (!liveCats.has(c)) _collapsedCats.delete(c); }
     renderSkills(_skillsData);
+    _renderSkillSyncBar();
   } catch(e) { box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">Error: ${esc(e.message)}</div>`; }
+}
+
+// Skills live in several places (Hermes, Claude Code, plugins, the shared
+// ~/.agents dir). This bar reports how many are not yet reachable from every
+// agent and offers to link them. It is an explicit action, never automatic:
+// sharing creates symlinks in the user's home directories.
+async function _renderSkillSyncBar() {
+  const list = $('skillsList');
+  if (!list || !list.parentNode) return;
+  let bar = document.getElementById('skillsSyncBar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'skillsSyncBar';
+    bar.className = 'skills-sync-bar';
+    list.parentNode.insertBefore(bar, list);
+  }
+  try {
+    const status = await api('/api/skills/sync-status');
+    const pending = Number(status.count || 0);
+    if (!pending) {
+      bar.innerHTML = `<span class="skills-sync-ok">${esc(t('skills_sync_all_shared'))}</span>`;
+      return;
+    }
+    bar.innerHTML = `<span>${esc(String(t('skills_sync_pending')).replace('{0}', pending))}</span>` +
+      `<button type="button" class="skills-sync-btn" id="skillsSyncBtn">${esc(t('skills_sync_action'))}</button>`;
+    const btn = document.getElementById('skillsSyncBtn');
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = t('skills_sync_working');
+      try {
+        const res = await api('/api/skills/sync', {method:'POST', body: JSON.stringify({dry_run:false})});
+        _skillsData = null;
+        await loadSkills();
+        toast(String(t('skills_sync_done')).replace('{0}', Number(res.synced || 0)));
+      } catch(e) {
+        btn.disabled = false;
+        btn.textContent = t('skills_sync_action');
+        toast(`${t('skills_sync_failed')}: ${e.message}`);
+      }
+    };
+  } catch(_) {
+    // Sync status is supplementary; never let it break the skills list.
+    bar.remove();
+  }
 }
 
 let _collapsedCats = new Set(); // persisted collapsed state across re-renders

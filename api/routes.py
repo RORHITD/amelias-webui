@@ -742,6 +742,28 @@ def _active_skill_search_dirs(skills_dir: Path) -> list[Path]:
     return [p for p in dirs if p.exists()]
 
 
+def _resolvable_skill_dirs(skills_dir: Path) -> list[Path]:
+    """Search roots for resolving a skill *by name* (view, toggle, content).
+
+    Wider than :func:`_active_skill_search_dirs`, which stays Hermes-only so the
+    skills *listing* keeps its existing categories. The Skills screen now shows
+    skills owned by other agents, so resolving one by name has to look in those
+    roots too -- otherwise every control offered on an external skill answers
+    404 for a skill the same screen just displayed.
+    """
+    dirs = list(_active_skill_search_dirs(skills_dir))
+    try:
+        from api.skill_sources import discover_sources
+
+        for source in discover_sources():
+            root = Path(source["root"])
+            if root not in dirs:
+                dirs.append(root)
+    except Exception:
+        logger.debug("external skill roots unavailable", exc_info=True)
+    return [p for p in dirs if p.exists()]
+
+
 def _worktree_retained_payload(session) -> dict:
     """Return explicit no-cleanup metadata for worktree-backed session actions."""
     worktree_path = getattr(session, "worktree_path", None) if session else None
@@ -1049,7 +1071,9 @@ def _skill_view_from_active_dir(name: str) -> dict:
     from tools.skills_tool import skill_view as _skill_view
 
     skills_dir = _active_skills_dir()
-    search_dirs = _active_skill_search_dirs(skills_dir)
+    # Wider set: the Skills screen lists other agents' skills, so opening one
+    # has to be able to resolve it outside the Hermes tree.
+    search_dirs = _resolvable_skill_dirs(skills_dir)
     skill_dir, skill_md = _find_skill_in_dirs(name, search_dirs)
     if not skill_md:
         # Preserve plugin-qualified skill viewing without falling back to the
@@ -9460,7 +9484,24 @@ def _dedupe_cli_sidebar_sessions_for_api(
     return _include_project_hidden_background_sidebar_sessions(candidates, visible)
 
 
-CLI_VISIBLE_SESSION_CAP = 20
+def _cli_visible_session_cap_default() -> int:
+    """Sidebar cap for imported CLI sessions.
+
+    Upstream hard-codes 20, which silently hides older Claude Code sessions
+    from the sidebar *and* from client-side search (the phone can only filter
+    rows the server actually sent). Read it from the environment so a machine
+    with hundreds of CLI sessions can surface them all; 0 disables the cap.
+    """
+    raw = os.getenv("HERMES_WEBUI_CLI_SESSION_CAP", "").strip()
+    if not raw:
+        return 20
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 20
+
+
+CLI_VISIBLE_SESSION_CAP = _cli_visible_session_cap_default()
 
 
 def _cap_recent_cli_sessions(sessions: list[dict], cli_cap: int = CLI_VISIBLE_SESSION_CAP) -> list[dict]:
@@ -13802,7 +13843,71 @@ def handle_get(handler, parsed) -> bool:
         qs = parse_qs(parsed.query)
         category = qs.get("category", [None])[0]
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
-        return j(handler, {"skills": data.get("skills", [])})
+        skills = list(data.get("skills", []))
+        # Additive merge: the Hermes-local listing above keeps its existing
+        # shape, categories and disabled flags untouched, and skills belonging
+        # to the other agents on this machine (Claude, plugins, project trees,
+        # the shared ~/.agents dir) are appended with their source as category.
+        # Without this the screen showed only ~/.hermes/skills, which on this
+        # machine was a quarter of what was installed.
+        try:
+            from api.skill_sources import aggregate_skills
+
+            known = {sk.get("name") for sk in skills}
+            for extra in aggregate_skills().get("skills", []):
+                if extra.get("name") in known or extra.get("source") == "hermes":
+                    continue
+                if category and extra.get("source_label") != category:
+                    continue
+                skills.append({
+                    "name": extra.get("name"),
+                    "description": extra.get("description", ""),
+                    "category": extra.get("source_label"),
+                    "disabled": False,
+                    "source": extra.get("source"),
+                    "source_label": extra.get("source_label"),
+                    "read_only": not extra.get("writable", False),
+                    "path": extra.get("path"),
+                })
+        except Exception:
+            logger.debug("external skill sources unavailable", exc_info=True)
+        return j(handler, {"skills": skills})
+
+    if parsed.path == "/api/reasoning-overrides":
+        # Per-model reasoning effort. agent.reasoning_overrides is the agent's
+        # documented chokepoint (resolve_reasoning_config), honoured by every
+        # surface including cron -- which is what makes a Loop's effort
+        # configurable at all: cron has no per-job effort field, but it does
+        # take a per-job model, and effort resolves from that model.
+        try:
+            from hermes_constants import VALID_REASONING_EFFORTS
+
+            valid = list(VALID_REASONING_EFFORTS)
+        except Exception:
+            valid = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+        with _cfg_lock:
+            cfg = _load_yaml_config_file(_active_profile_config_path())
+        agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+        overrides = agent_cfg.get("reasoning_overrides")
+        return j(handler, {
+            "overrides": overrides if isinstance(overrides, dict) else {},
+            "global": agent_cfg.get("reasoning_effort"),
+            "valid_efforts": valid,
+        })
+
+    if parsed.path == "/api/skills/sources":
+        from api.skill_sources import discover_sources
+
+        return j(handler, {"sources": [
+            {"slug": s["slug"], "label": s["label"], "path": str(s["root"]),
+             "writable": s["writable"]}
+            for s in discover_sources()
+        ]})
+
+    if parsed.path == "/api/skills/sync-status":
+        from api.skill_sources import sync_all
+
+        return j(handler, sync_all(dry_run=True))
 
     if parsed.path == "/api/skills/usage":
         from api.skill_usage import read_skill_usage
@@ -13854,7 +13959,7 @@ def handle_get(handler, parsed) -> bool:
                 return bad(handler, "Invalid skill name", 400)
             skills_dir = _active_skills_dir()
             skill_dir, _skill_md = _find_skill_in_dirs(
-                name, _active_skill_search_dirs(skills_dir)
+                name, _resolvable_skill_dirs(skills_dir)
             )
             if not skill_dir:
                 return bad(handler, "Skill not found", 404)
@@ -15820,7 +15925,66 @@ def handle_post(handler, parsed) -> bool:
         except RuntimeError as e:
             return bad(handler, _sanitize_error(e), 500)
 
+    if parsed.path == "/api/reasoning-overrides":
+        model_name = str((body or {}).get("model") or "").strip()
+        if not model_name:
+            return bad(handler, "model is required")
+        effort = (body or {}).get("effort")
+        try:
+            from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+
+            valid = set(VALID_REASONING_EFFORTS) | {"none", "false", "disabled"}
+        except Exception:
+            parse_reasoning_effort = None
+            valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+        clearing = effort in (None, "")
+        if not clearing:
+            # Reject rather than silently storing a value the agent will parse
+            # to None and quietly ignore.
+            if str(effort).strip().lower() not in valid:
+                return bad(handler, f"effort must be one of {sorted(valid)}")
+            if parse_reasoning_effort is not None and parse_reasoning_effort(effort) is None:
+                return bad(handler, f"unrecognized effort: {effort}")
+        config_path = _active_profile_config_path()
+        with _cfg_lock:
+            cfg = _load_yaml_config_file(config_path)
+            if not isinstance(cfg.get("agent"), dict):
+                cfg["agent"] = {}
+            overrides = cfg["agent"].get("reasoning_overrides")
+            if not isinstance(overrides, dict):
+                overrides = {}
+            if clearing:
+                overrides.pop(model_name, None)
+            else:
+                overrides[model_name] = str(effort).strip().lower()
+            if overrides:
+                cfg["agent"]["reasoning_overrides"] = overrides
+            else:
+                cfg["agent"].pop("reasoning_overrides", None)
+            _save_yaml_config_file(config_path, cfg)
+        return j(handler, {"ok": True, "model": model_name,
+                           "effort": None if clearing else str(effort).strip().lower(),
+                           "overrides": overrides})
+
     # ── Skills (POST) ──
+    if parsed.path == "/api/skills/link":
+        from api.skill_sources import link_skill
+
+        return j(handler, link_skill((body or {}).get("name")))
+
+    if parsed.path == "/api/skills/unlink":
+        from api.skill_sources import unlink_skill
+
+        return j(handler, unlink_skill((body or {}).get("name")))
+
+    if parsed.path == "/api/skills/sync":
+        from api.skill_sources import sync_all
+
+        # Defaults to a dry run on purpose: a real sync creates ~100 symlinks
+        # across the user's home directories, so it stays an explicit choice.
+        dry = bool((body or {}).get("dry_run", True))
+        return j(handler, sync_all(dry_run=dry))
+
     if parsed.path == "/api/skills/save":
         return _handle_skill_save(handler, body)
 
@@ -23550,6 +23714,23 @@ def _handle_cron_create(handler, body):
         toast_notifications = body.get("toast_notifications") is not False
         requested_model = body.get("model") or None
         requested_provider = body.get("provider") or None
+        # ``repeat`` turns a schedule into a bounded loop: run N times, then
+        # stop. create_job has always supported it upstream; it simply was not
+        # reachable from the API, so every job was open-ended.
+        raw_repeat = body.get("repeat")
+        try:
+            repeat = int(raw_repeat) if raw_repeat not in (None, "") else None
+        except (TypeError, ValueError):
+            return bad(handler, "repeat must be an integer")
+        if repeat is not None and repeat < 1:
+            return bad(handler, "repeat must be 1 or greater")
+        # Only pass the optional loop arguments when the caller actually set
+        # them, so an ordinary create keeps the exact call shape it always had.
+        extra_kwargs = {}
+        if repeat is not None:
+            extra_kwargs["repeat"] = repeat
+        if body.get("workdir"):
+            extra_kwargs["workdir"] = body["workdir"]
         job = create_job(
             prompt=body["prompt"],
             schedule=body["schedule"],
@@ -23558,6 +23739,7 @@ def _handle_cron_create(handler, body):
             skills=body.get("skills") or [],
             model=requested_model,
             provider=requested_provider,
+            **extra_kwargs,
         )
         post_create_updates = {}
         if profile is not None:
@@ -26875,7 +27057,7 @@ def _handle_skill_toggle(handler, body):
 
     # Validate the skill exists in the filesystem
     skills_dir = _active_skills_dir()
-    search_dirs = _active_skill_search_dirs(skills_dir)
+    search_dirs = _resolvable_skill_dirs(skills_dir)
     skill_dir, skill_md = _find_skill_in_dirs(name, search_dirs)
     if not skill_md:
         return bad(handler, f"Skill '{name}' not found", 404)

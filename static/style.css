@@ -6766,6 +6766,13 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
 .kanban-board-consolidated .kanban-column-body{height:100%;max-height:unset;overscroll-behavior:auto;}
 .kanban-card{border:1px solid var(--border);border-radius:9px;background:var(--bg);padding:10px;cursor:pointer;box-shadow:var(--shadow-sm);}
 .kanban-card:hover,.kanban-card.selected{border-color:var(--accent);}
+/* Derived session cards: a dashed edge marks them as projections of a live
+   transcript rather than rows you can drag or edit. */
+.kanban-card-session{border-style:dashed;}
+.kanban-card-session .kanban-card-id{text-transform:uppercase;letter-spacing:.08em;}
+/* The pending question is the reason the card is on the board -- give it the
+   full text rather than the 3-line clamp the generic body gets. */
+.kanban-card-session .kanban-card-question{-webkit-line-clamp:unset;color:var(--text);font-style:italic;}
 .kanban-card-title{font-size:13px;font-weight:650;color:var(--text);line-height:1.35;margin-bottom:6px;}
 .kanban-card-body{font-size:12px;color:var(--muted);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:8px;}
 .kanban-meta{font-size:11px;color:var(--muted);line-height:1.35;}
@@ -7322,3 +7329,15 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 /* Settings field highlight (mirrors msg-question-highlight / _highlightQuestionRow pattern) */
 .settings-field-highlight { animation: settings-field-pulse 1.6s ease-out; }
 @keyframes settings-field-pulse { 0% { box-shadow: 0 0 0 0 var(--focus-ring); } 35% { box-shadow: 0 0 0 4px var(--focus-ring); } 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } }
+
+/* Skills sync bar: reports how many skills are not reachable from every agent.
+   Sharing is an explicit click because it writes symlinks into the user's home
+   directories. */
+.skills-sync-bar{display:flex;align-items:center;gap:10px;justify-content:space-between;
+  padding:8px 12px;margin:0 0 6px;border:1px solid var(--border);border-radius:8px;
+  background:var(--bg);font-size:12px;color:var(--muted);}
+.skills-sync-bar .skills-sync-ok{color:var(--muted);}
+.skills-sync-btn{border:1px solid var(--border);background:transparent;color:var(--text);
+  border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;white-space:nowrap;}
+.skills-sync-btn:hover:not(:disabled){border-color:var(--accent);}
+.skills-sync-btn:disabled{opacity:.6;cursor:default;}
