@@ -72,8 +72,17 @@ document.addEventListener('DOMContentLoaded', function () {
       try { data = await res.json(); } catch (_) {}
       if (res.ok && data.ok) {
         window.location.href = _safeNextPath();
-      } else {
+      } else if (res.status === 401) {
         showErr(data.error || invalidPw);
+      } else {
+        // Anything other than a clean 401 is NOT a bad password: a 404 means
+        // this page posted to an endpoint the server does not have (a stale
+        // tab still running an older login.js against a newer server), a 5xx
+        // is a server fault, and a proxy can inject its own status. Reporting
+        // all of them as "Invalid password" sends the user hunting for a
+        // credential problem that does not exist — surface the real status so
+        // the failure is diagnosable from the screen alone.
+        showErr((data.error || 'Login failed') + ' (HTTP ' + res.status + ')');
       }
     } catch (ex) {
       showErr(connFailed);

@@ -7986,7 +7986,19 @@ function _startHiddenActiveStreamPoll(sid) {
     if (S.activeStreamId) return; // already rendering; wait it out
     try {
       fetch(_apiUrl('api/session/status?session_id=' + encodeURIComponent(sid)), {credentials: 'same-origin'})
-        .then(r => r.ok ? r.json() : null)
+        .then(r => {
+          // Auth failure is terminal for this poll. Once the session cookie is
+          // gone or expired every later tick 401s identically, so retrying is
+          // pure noise — a hidden tab left open overnight otherwise polls
+          // forever (browser-throttled to ~60s, which is what it looks like in
+          // the server log: one 401 per minute, indefinitely). The existing
+          // bounded give-up below only covers failed *attaches*, not auth.
+          if (r.status === 401 || r.status === 403) {
+            _stopHiddenActiveStreamPoll();
+            return null;
+          }
+          return r.ok ? r.json() : null;
+        })
         .then(d => {
           if (!d || _sessionStreamHiddenPollSid !== sid) return;
           const streamId = d.active_stream_id;
