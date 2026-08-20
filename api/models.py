@@ -6748,7 +6748,25 @@ def import_cli_session(
 
 CLAUDE_CODE_SOURCE = 'claude_code'
 CLAUDE_CODE_SOURCE_LABEL = 'Claude Code'
-CLAUDE_CODE_MAX_FILES = 300
+def _claude_code_max_files_default() -> int:
+    """How many of the NEWEST Claude Code transcripts to surface.
+
+    Upstream's 300 is a recency window, not a total: on an install with
+    thousands of transcripts it can reach back only a day or two, so older
+    project sessions never reach the sidebar or search. Keep this <=
+    ``_CLAUDE_CODE_PARSE_CACHE_MAX`` (1000) or the memoized parse cache
+    thrashes and every sidebar build re-parses from disk.
+    """
+    raw = os.getenv('HERMES_WEBUI_CLAUDE_MAX_FILES', '').strip()
+    if not raw:
+        return 300
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 300
+
+
+CLAUDE_CODE_MAX_FILES = _claude_code_max_files_default()
 CLAUDE_CODE_MAX_FILE_BYTES = 100 * 1024 * 1024
 CLAUDE_CODE_MAX_MESSAGES_PER_FILE = 1000
 CLAUDE_CODE_MAX_CONTENT_CHARS = 200_000
@@ -6824,18 +6842,51 @@ def _extract_claude_code_text(content) -> str:
     return str(content)[:CLAUDE_CODE_MAX_CONTENT_CHARS]
 
 
-def _parse_claude_code_jsonl(path: Path, *, max_messages: int = CLAUDE_CODE_MAX_MESSAGES_PER_FILE) -> tuple[list[dict], str | None, float | None, float | None]:
+def _parse_claude_code_jsonl(path: Path, *, max_messages: int = CLAUDE_CODE_MAX_MESSAGES_PER_FILE) -> tuple[list[dict], str | None, float | None, float | None, dict]:
     messages: list[dict] = []
     summary_title = None
+    ai_title = None
+    cwd = None
+    git_branch = None
+    entrypoint = None
     first_ts = None
     last_ts = None
+    last_human_raw = None
+    last_assistant_raw = None
     try:
         with path.open('r', encoding='utf-8', errors='replace') as fh:
             for line in fh:
-                if len(messages) >= max_messages:
-                    break
                 line = line.strip()
                 if not line:
+                    continue
+                # Raw-line bookmarks for the agent-state classifier, kept across
+                # BOTH the parsed head and the unparsed tail. Only the final one
+                # of each is ever json-decoded (below the loop), so this costs a
+                # substring scan per line instead of a parse -- which matters,
+                # because assistant entries are ~a third of every transcript.
+                # Claude Code writes compact JSON, hence no whitespace variants.
+                if '"promptSource":"typed"' in line or '"promptSource":"queued"' in line:
+                    last_human_raw = line
+                if '"type":"assistant"' in line:
+                    last_assistant_raw = line
+                if len(messages) >= max_messages:
+                    # The message budget is spent, but Claude Code appends its
+                    # rolling ``ai-title`` at the very END of a transcript (~99%
+                    # in on every real session measured). Breaking out here would
+                    # pin the sidebar to a stale title on exactly the long
+                    # sessions that most need a fresh one, so keep scanning for
+                    # it. The substring guard keeps the tail cheap: a memchr per
+                    # line instead of a json.loads per line.
+                    if '"ai-title"' not in line:
+                        continue
+                    try:
+                        tail = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(tail, dict):
+                        candidate = tail.get('aiTitle')
+                        if isinstance(candidate, str) and candidate.strip():
+                            ai_title = ' '.join(candidate.split())[:80]
                     continue
                 try:
                     raw = json.loads(line)
@@ -6843,6 +6894,26 @@ def _parse_claude_code_jsonl(path: Path, *, max_messages: int = CLAUDE_CODE_MAX_
                     continue
                 if not isinstance(raw, dict):
                     continue
+                # Claude Code rewrites an ``ai-title`` entry as a session's focus
+                # shifts, so the LAST one is the current subject -- unlike
+                # ``summary``/``title`` below, which are first-wins and which no
+                # real transcript actually carries (0/60 sampled).
+                if raw.get('type') == 'ai-title':
+                    candidate = raw.get('aiTitle')
+                    if isinstance(candidate, str) and candidate.strip():
+                        ai_title = ' '.join(candidate.split())[:80]
+                if cwd is None:
+                    raw_cwd = raw.get('cwd')
+                    if isinstance(raw_cwd, str) and raw_cwd.strip():
+                        cwd = raw_cwd
+                if git_branch is None:
+                    raw_branch = raw.get('gitBranch')
+                    if isinstance(raw_branch, str) and raw_branch.strip():
+                        git_branch = raw_branch
+                if entrypoint is None:
+                    raw_entry = raw.get('entrypoint')
+                    if isinstance(raw_entry, str) and raw_entry.strip():
+                        entrypoint = raw_entry
                 if not summary_title:
                     summary = raw.get('summary') or raw.get('title')
                     if isinstance(summary, str) and summary.strip():
@@ -6878,13 +6949,49 @@ def _parse_claude_code_jsonl(path: Path, *, max_messages: int = CLAUDE_CODE_MAX_
                         item['timestamp'] = ts
                     messages.append(item)
     except Exception:
-        return [], None, None, None
-    return messages, summary_title, first_ts, last_ts
+        return [], None, None, None, {}
+
+    # Decode only the two bookmarked lines. ``last_human_ts`` is when a human
+    # last typed something; ``last_assistant_ts`` is when the agent last spoke.
+    # Their order is what separates "the agent is working" from "the agent is
+    # waiting on me" -- see _claude_code_agent_state.
+    last_human_ts = None
+    last_assistant_ts = None
+    last_assistant_tail = None
+    if last_human_raw:
+        try:
+            record = json.loads(last_human_raw)
+            if isinstance(record, dict):
+                last_human_ts = _parse_claude_code_timestamp(record.get('timestamp'))
+        except Exception:
+            pass
+    if last_assistant_raw:
+        try:
+            record = json.loads(last_assistant_raw)
+            if isinstance(record, dict):
+                last_assistant_ts = _parse_claude_code_timestamp(record.get('timestamp'))
+                inner = record.get('message') if isinstance(record.get('message'), dict) else record
+                text = _extract_claude_code_text(inner.get('content'))
+                if text and text.strip():
+                    last_assistant_tail = ' '.join(text.split())[-400:]
+        except Exception:
+            pass
+
+    meta = {
+        'ai_title': ai_title,
+        'cwd': cwd,
+        'git_branch': git_branch,
+        'entrypoint': entrypoint,
+        'last_human_ts': last_human_ts,
+        'last_assistant_ts': last_assistant_ts,
+        'last_assistant_tail': last_assistant_tail,
+    }
+    return messages, summary_title, first_ts, last_ts, meta
 
 
 def _parse_claude_code_jsonl_cached(
     path: Path, *, max_messages: int = CLAUDE_CODE_MAX_MESSAGES_PER_FILE
-) -> tuple[list[dict], str | None, float | None, float | None]:
+) -> tuple[list[dict], str | None, float | None, float | None, dict]:
     """``_parse_claude_code_jsonl`` memoized by the file's (path, mtime_ns, size, ctime_ns).
 
     The transcript files under ``~/.claude/projects`` are global and rarely
@@ -6914,11 +7021,12 @@ def _parse_claude_code_jsonl_cached(
         hit = _CLAUDE_CODE_PARSE_CACHE.get(key)
         if hit is not None:
             _CLAUDE_CODE_PARSE_CACHE.move_to_end(key)
-            messages, summary_title, first_ts, last_ts = hit
+            messages, summary_title, first_ts, last_ts, meta = hit
             # Return a shallow copy of the message list so a caller mutating it
             # can't corrupt the cached entry; the per-message dicts are treated
-            # as read-only by all current callers.
-            return list(messages), summary_title, first_ts, last_ts
+            # as read-only by all current callers. ``meta`` is copied for the
+            # same reason -- it is a fresh dict per parse, not shared state.
+            return list(messages), summary_title, first_ts, last_ts, dict(meta)
 
     parsed = _parse_claude_code_jsonl(path, max_messages=max_messages)
 
@@ -6931,8 +7039,8 @@ def _parse_claude_code_jsonl_cached(
             _CLAUDE_CODE_PARSE_CACHE.move_to_end(key)
             while len(_CLAUDE_CODE_PARSE_CACHE) > _CLAUDE_CODE_PARSE_CACHE_MAX:
                 _CLAUDE_CODE_PARSE_CACHE.popitem(last=False)
-    messages, summary_title, first_ts, last_ts = parsed
-    return list(messages), summary_title, first_ts, last_ts
+    messages, summary_title, first_ts, last_ts, meta = parsed
+    return list(messages), summary_title, first_ts, last_ts, dict(meta)
 
 
 def clear_claude_code_parse_cache() -> None:
@@ -6980,7 +7088,80 @@ def _iter_claude_code_jsonl_files(projects_dir: Path | str | None = None, *, max
         return
 
 
-def _claude_code_title(messages: list[dict], summary_title: str | None) -> str:
+# A session that moved within this window is treated as still running rather
+# than waiting on a human -- long enough to cover a slow tool call, short enough
+# that a genuinely stuck agent surfaces the same sitting.
+CLAUDE_CODE_RUNNING_WINDOW_SECONDS = 600
+
+# How long an unanswered question still counts as "blocked". Past this, nobody
+# is really waiting: measured on a working machine, the unanswered-question tail
+# ran out to 250 hours, and a board that lists a ten-day-old "Want me to...?"
+# next to this morning's is a board people stop trusting. Stale ones fall
+# through to 'done' rather than disappearing.
+CLAUDE_CODE_BLOCKED_MAX_AGE_SECONDS = 48 * 3600
+
+
+_QUESTION_URL_RE = re.compile(r'https?://\S+')
+
+
+def _trailing_question(text: str | None, max_chars: int = 180) -> str | None:
+    """The last question in an agent's closing remarks, or None.
+
+    Deliberately looks only at the tail: an agent that asked something in
+    passing and then carried on working is not blocked, but one whose *final*
+    words are a question has handed the turn back.
+    """
+    if not text:
+        return None
+    # A '?' starting a URL query string is not a question. Without this, a
+    # closing message that merely links somewhere reads as an unanswered ask.
+    tail = _QUESTION_URL_RE.sub(' ', text[-400:])
+    end = tail.rfind('?')
+    if end == -1:
+        return None
+    start = max(tail.rfind('. ', 0, end), tail.rfind('! ', 0, end), tail.rfind('\n', 0, end))
+    question = (tail[start + 1:end + 1] if start != -1 else tail[:end + 1]).strip()
+    if not question:
+        return None
+    return question[-max_chars:].lstrip('.!').strip() or None
+
+
+def _claude_code_agent_state(meta: dict, last_ts: float | None, now: float | None = None) -> tuple[str, str | None]:
+    """Classify a Claude Code session as running / blocked / done.
+
+    ``blocked`` is the state worth surfacing: the agent asked something and no
+    human has answered. Message roles alone cannot detect this, because Claude
+    Code stores tool results as *user*-role messages -- so a transcript ending
+    in "user" may just be a bash command printing output. Only entries carrying
+    ``promptSource`` are genuinely typed, which is what the timestamps compare.
+    """
+    now = time.time() if now is None else now
+    human_ts = meta.get('last_human_ts')
+    assistant_ts = meta.get('last_assistant_ts')
+
+    # A human spoke after the agent last did: the agent owns the turn.
+    if human_ts is not None and (assistant_ts is None or human_ts >= assistant_ts):
+        return 'running', None
+    if last_ts and (now - last_ts) <= CLAUDE_CODE_RUNNING_WINDOW_SECONDS:
+        return 'running', None
+
+    question = _trailing_question(meta.get('last_assistant_tail'))
+    if question and (not last_ts or (now - last_ts) <= CLAUDE_CODE_BLOCKED_MAX_AGE_SECONDS):
+        return 'blocked', question
+    return 'done', None
+
+
+def _claude_code_title(messages: list[dict], summary_title: str | None, ai_title: str | None = None) -> str:
+    """Best available title for a Claude Code transcript, freshest source first.
+
+    ``ai_title`` is Claude Code's own rolling title, rewritten as the session's
+    focus moves, so it tracks what the session is doing *now*. The first-user-
+    message fallback below is the opposite -- it freezes at whatever was typed
+    first, which is why a session that opened with a pasted email or a hook
+    prompt kept an unrecognizable title for its entire life.
+    """
+    if ai_title:
+        return ai_title
     if summary_title:
         return summary_title
     for msg in messages:
@@ -6989,6 +7170,22 @@ def _claude_code_title(messages: list[dict], summary_title: str | None) -> str:
             if text:
                 return text[:80]
     return 'Claude Code Session'
+
+
+def _hide_automation_sessions() -> bool:
+    """Whether SDK-spawned sessions are kept out of the session list.
+
+    Hooks, scripts and subagents produce real transcripts, but nobody is waiting
+    on them and they are named after whatever prompt spawned them -- on this
+    machine 116 of 150 recent transcripts were memory-hook agents all sharing one
+    title, which is what buried the sessions a person actually typed. They are
+    only hidden from the *list*: opening one by id still works, and setting
+    HERMES_WEBUI_HIDE_AUTOMATION_SESSIONS=0 brings them back.
+    """
+    raw = os.getenv('HERMES_WEBUI_HIDE_AUTOMATION_SESSIONS')
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in ('0', 'false', 'no', 'off', '')
 
 
 def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_files: int = CLAUDE_CODE_MAX_FILES, max_file_bytes: int = CLAUDE_CODE_MAX_FILE_BYTES) -> list:
@@ -7006,7 +7203,7 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
     # sidebar build (#4718). Resolve it a single time.
     cc_workspace = str(get_last_workspace())
     for path in _iter_claude_code_jsonl_files(projects_dir, max_files=max_files, max_file_bytes=max_file_bytes) or []:
-        messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl_cached(path)
+        messages, summary_title, first_ts, last_ts, cc_meta = _parse_claude_code_jsonl_cached(path)
         if not messages:
             continue
         sid = _claude_code_session_id(path)
@@ -7025,9 +7222,19 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
             _mtime = None
         created_at = first_ts or last_ts or _mtime
         updated_at = last_ts or first_ts or _mtime
+        agent_state, blocked_question = _claude_code_agent_state(cc_meta, updated_at)
         sessions.append({
             'session_id': sid,
-            'title': _claude_code_title(messages, summary_title),
+            'title': _claude_code_title(messages, summary_title, cc_meta.get('ai_title')),
+            # Board state. ``is_automation`` marks sessions spawned by the SDK
+            # (hooks, scripts) rather than typed by a human -- they are real
+            # sessions but they are not work anyone is waiting on, so the UI can
+            # group them away instead of burying the interactive ones.
+            'agent_state': agent_state,
+            'blocked_question': blocked_question,
+            'is_automation': cc_meta.get('entrypoint') == 'sdk-cli',
+            'git_branch': cc_meta.get('git_branch'),
+            'cwd': cc_meta.get('cwd'),
             'workspace': cc_workspace,
             'model': 'claude-code',
             'message_count': len(messages),
@@ -7045,6 +7252,8 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
             'is_cli_session': True,
             'read_only': True,
         })
+    if _hide_automation_sessions():
+        sessions = [s for s in sessions if not s.get('is_automation')]
     sessions.sort(key=lambda s: s.get('last_message_at') or s.get('updated_at') or 0, reverse=True)
     return sessions
 
@@ -7057,7 +7266,7 @@ def get_claude_code_session_messages(sid, projects_dir: Path | str | None = None
     for path in _iter_claude_code_jsonl_files(projects_dir) or []:
         if _claude_code_session_id(path) != sid:
             continue
-        messages, _summary_title, _first_ts, _last_ts = _parse_claude_code_jsonl_cached(path)
+        messages, _summary_title, _first_ts, _last_ts, _meta = _parse_claude_code_jsonl_cached(path)
         return messages
     return []
 

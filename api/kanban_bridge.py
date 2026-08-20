@@ -22,7 +22,11 @@ from urllib.parse import parse_qs, unquote
 from api.helpers import bad, j
 from api.workspace import resolve_trusted_workspace
 
-BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done"]
+# "review" is the board's Verified column. It is deliberately an existing
+# upstream status (kanban_db.VALID_STATUSES already accepts it) rather than a
+# new "verified" one, so a human-confirmed task is a status the task DB will
+# actually store instead of rejecting on write.
+BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done", "review"]
 _TASK_PREFIX = "/api/kanban/tasks/"
 
 
@@ -191,6 +195,25 @@ def _comment_counts(conn):
     return {row["task_id"]: int(row["n"] or 0) for row in rows}
 
 
+def _sessions_volatile() -> bool:
+    """True when a session card could change without the task DB being touched.
+
+    Deliberately conservative rather than clever. A fingerprint cache would be
+    tighter, but ``since`` is a task-event id shared across clients: if client A
+    advanced a cached fingerprint, client B would be told "nothing changed" and
+    sit on stale state. Suppressing the short-circuit whenever any session is
+    running or blocked costs one board rebuild per poll while work is live, and
+    is correct for every client. When nothing is active -- the common idle case
+    -- the short-circuit still applies.
+    """
+    try:
+        from api.session_board import session_cards
+
+        return any(card.get('status') in ('running', 'blocked') for card in session_cards())
+    except Exception:
+        return False
+
+
 def _board_payload(parsed):
     """Build the full board JSON payload: kanban columns with tasks, filter state, and latest_event_id."""
     board = _resolve_board(parsed)
@@ -212,7 +235,11 @@ def _board_payload(parsed):
 
     with _conn(board=board) as conn:
         latest_event_id = _latest_event_id(conn)
-        if since is not None and since >= latest_event_id:
+        # ``latest_event_id`` only moves when the task DB is written to, but a
+        # session can go running -> blocked without any task ever changing. Fold
+        # the session state into the short-circuit, or the board would answer
+        # "nothing changed" while an agent sits waiting on an answer.
+        if since is not None and since >= latest_event_id and not _sessions_volatile():
             return {"changed": False, "latest_event_id": latest_event_id, "read_only": False}
 
         tasks = kb.list_tasks(
@@ -234,6 +261,15 @@ def _board_payload(parsed):
             {"name": name, "tasks": [row(task) for task in tasks if task.status == name]}
             for name in BOARD_COLUMNS
         ]
+        # Live agent sessions ride on the same board as hand-written tasks, as
+        # read-only derived cards. Never let a session-projection error take the
+        # real board down with it -- tasks are the source of truth here.
+        try:
+            from api.session_board import merge_into_columns
+
+            merge_into_columns(columns)
+        except Exception:
+            pass
         if include_archived:
             columns.append({
                 "name": "archived",
