@@ -43,6 +43,16 @@ def _card(session: dict, now: float) -> dict:
     question = session.get('blocked_question')
     title = session.get('title') or 'Untitled session'
 
+    # Project label for board grouping (swim-lanes). Render must stay instant,
+    # so this reads the organizer cache / keyword heuristic only -- the AI pass
+    # that fills the cache runs in the background, never inline here.
+    try:
+        from api.session_organizer import project_for_session
+
+        project_label = project_for_session(session, allow_model=False)
+    except Exception:
+        project_label = None
+
     return {
         # Namespaced so a derived id can never collide with a real task id.
         'id': f"session:{session.get('session_id')}",
@@ -60,6 +70,11 @@ def _card(session: dict, now: float) -> dict:
         'workspace_path': session.get('cwd'),
         'branch_name': session.get('git_branch'),
         'project_id': None,
+        # Human-readable project the session was filed under (AI organizer +
+        # heuristic). Drives the board's project swim-lanes. Clients that don't
+        # know the field ignore it.
+        'project': project_label,
+        'project_label': project_label,
         'tenant': None,
         'result': None,
         'age_seconds': age,
