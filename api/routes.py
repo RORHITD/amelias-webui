@@ -11752,6 +11752,56 @@ def _run_lifecycle_health() -> dict:
     return payload
 
 
+def _model_backend_health(timeout_seconds: float = 1.5) -> dict:
+    """Is the configured model backend actually reachable?
+
+    A local backend (Ollama, an MLX server, llama.cpp) can die or lose its port
+    to another process while the web UI keeps serving happily -- the UI looks
+    fine and every chat fails with an opaque error. Probing the configured
+    ``model.base_url`` here means a supervisor (and the UI) can tell the
+    difference between "Hermes is down" and "the model server is down".
+
+    Deliberately cheap and fail-soft: a short timeout, and any exception is
+    reported as a status rather than raised, so /health never fails because a
+    model server is unreachable.
+    """
+    import urllib.request
+    import urllib.error
+
+    t0 = time.time()
+    try:
+        from api.config import get_config
+
+        cfg = get_config() or {}
+        base_url = str((cfg.get("model") or {}).get("base_url") or "").rstrip("/")
+    except Exception as exc:
+        return {"status": "unknown", "error": type(exc).__name__}
+
+    if not base_url:
+        return {"status": "not_configured"}
+
+    # /v1/models is the OpenAI-compatible liveness probe every local server
+    # implements; it does not load or run the model.
+    url = base_url + "/models" if base_url.endswith("/v1") else base_url + "/v1/models"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            code = getattr(resp, "status", 200)
+        return {
+            "status": "ok" if 200 <= int(code) < 400 else "error",
+            "base_url": base_url,
+            "http_status": int(code),
+            "ms": round((time.time() - t0) * 1000, 1),
+        }
+    except Exception as exc:
+        return {
+            "status": "unreachable",
+            "base_url": base_url,
+            "error": type(exc).__name__,
+            "ms": round((time.time() - t0) * 1000, 1),
+        }
+
+
 def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     """Run cheap probes that exercise the state paths used by the UI shell.
 
@@ -11766,6 +11816,7 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     """
     checks: dict[str, dict] = {}
 
+    checks["model_backend"] = _model_backend_health()
     checks["streams_lock"] = stream_check if stream_check is not None else _streams_lock_health()
     checks["stream_runtime"] = {
         "status": "ok",
