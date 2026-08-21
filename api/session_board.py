@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import time
 
-# A finished session stops being actionable quickly, and there are thousands of
-# them on a working machine. Only surface recent ones, and cap the column, so
-# 'done' never buries the two columns a person actually looks at.
-DONE_MAX_AGE_SECONDS = 24 * 3600
-DONE_MAX_CARDS = 12
+# Finished work stays visible so you can see what you completed, then ages out.
+# The board's Done column keeps ~2 weeks of finished sessions (was 24h) -- long
+# enough to answer "what did I get done", bounded so it never floods the board.
+DONE_MAX_AGE_SECONDS = 14 * 24 * 3600
+DONE_MAX_CARDS = 60
 # 'blocked' is the whole point of the board, so it gets a far looser cap --
 # high enough to never hide a real question, low enough to bound the payload.
 BLOCKED_MAX_CARDS = 50
@@ -107,6 +107,15 @@ def session_cards(sessions: list | None = None, now: float | None = None) -> lis
             sessions = get_claude_code_sessions()
         except Exception:
             return []
+
+    # Kick a background pass so the AI upgrades any heuristic/uncached project
+    # labels without ever blocking this render.
+    try:
+        from api.session_organizer import warm_async
+
+        warm_async(sessions)
+    except Exception:
+        pass
 
     cards: list[dict] = []
     for session in sessions or []:

@@ -1270,20 +1270,31 @@ def test_kanban_profile_lanes_explicitly_render_unassigned_lane():
     # Unassigned lane is appended last (after assigned lanes).
     assert "has(KANBAN_UNASSIGNED_LANE)" in lane_names_body
 
-    # _kanbanRenderProfileLanes uses _kanbanLaneKey for filtering and
-    # _kanbanLaneLabel for display, and emits the unassigned CSS class.
+    # _kanbanRenderProfileLanes delegates to the shared _kanbanRenderLanes with
+    # the assignee lane key/label and the unassigned constant.
     render_match = re.search(
-        r"function _kanbanRenderProfileLanes\(columns\)\{(.*?)\nfunction ",
+        r"function _kanbanRenderProfileLanes\(columns\)\{(.*?)\n\}",
         PANELS,
         re.DOTALL,
     )
     assert render_match, "_kanbanRenderProfileLanes() not found"
     render_body = render_match.group(1)
-    assert "_kanbanLaneNames(columns)" in render_body
-    assert "_kanbanLaneKey(task)" in render_body
-    assert "_kanbanLaneLabel(lane)" in render_body
-    assert "kanban-profile-lane-unassigned" in render_body
-    assert "kanban-profile-lane" in render_body
+    assert "_kanbanRenderLanes(columns, _kanbanLaneKey, _kanbanLaneLabel, KANBAN_UNASSIGNED_LANE)" in render_body
+
+    # The shared lane renderer filters by the key fn, labels via the label fn,
+    # appends the unassigned lane last, and emits the unassigned CSS class.
+    lanes_match = re.search(
+        r"function _kanbanRenderLanes\(columns, keyFn, labelFn, unassignedKey\)\{(.*?)\n\}",
+        PANELS,
+        re.DOTALL,
+    )
+    assert lanes_match, "_kanbanRenderLanes() not found"
+    lanes_body = lanes_match.group(1)
+    assert "keyFn(task)" in lanes_body
+    assert "labelFn(lane)" in lanes_body
+    assert "has(unassignedKey)" in lanes_body
+    assert "kanban-profile-lane-unassigned" in lanes_body
+    assert "kanban-profile-lane" in lanes_body
 
 
 def test_kanban_hidden_by_filters_ux():

@@ -5,6 +5,16 @@ let _kanbanLatestEventId = 0;
 let _kanbanPollTimer = null;
 let _kanbanCurrentTaskId = null;
 let _kanbanLanesByProfile = true;
+// Urgency × Project view: the default reader-facing board. Groups cards by the
+// project the organizer filed them under (swim-lanes) and collapses statuses
+// into Needs You / Active / Up Next / Done. Persisted per-browser; opt out to
+// fall back to the classic status columns.
+let _kanbanUrgencyView = (() => {
+  try {
+    const saved = localStorage.getItem('kanban_urgency_view');
+    return saved === null ? true : saved === '1';
+  } catch (_) { return true; }
+})();
 // Multi-board state. _kanbanCurrentBoard is the slug of the active board
 // the UI is currently viewing. null means "use whatever the server reports
 // as active" (i.e. don't pin a specific board in API calls). The UI
@@ -2178,6 +2188,17 @@ async function toggleKanbanViewMode(){
   }
 }
 
+function toggleKanbanUrgencyView(){
+  _kanbanUrgencyView = !_kanbanUrgencyView;
+  try { localStorage.setItem('kanban_urgency_view', _kanbanUrgencyView ? '1' : '0'); } catch (_) {}
+  const btn = $('btnKanbanUrgencyToggle');
+  if (btn) btn.setAttribute('aria-pressed', _kanbanUrgencyView ? 'true' : 'false');
+  _kanbanRenderBoard();
+  if (typeof showToast === 'function') {
+    showToast(_kanbanUrgencyView ? 'Grouped by project & urgency' : 'Classic status columns');
+  }
+}
+
 function _kanbanSetSelectOptions(el, values, allLabelKey){
   if (!el) return;
   const current = el.value || el.dataset.defaultValue || '';
@@ -2533,7 +2554,7 @@ function _kanbanRenderColumn(col){
   const tasks = col.tasks || [];
   return `<section class="kanban-column" data-status="${esc(col.name)}" data-kanban-status="${esc(col.name)}" ondragover="allowKanbanDrop(event)" ondragenter="event.currentTarget.classList.add('drop-target')" ondragleave="clearKanbanDrop(event)" ondrop="dropKanbanTask(event, '${esc(col.name)}')">
       <div class="kanban-column-head">
-        <span>${esc(_kanbanColumnLabel(col.name))}</span>
+        <span>${esc(col.label || _kanbanColumnLabel(col.name))}</span>
         <span class="kanban-count">${tasks.length}</span>
       </div>
       <div class="kanban-column-body">
@@ -2542,15 +2563,80 @@ function _kanbanRenderColumn(col){
     </section>`;
 }
 
-function _kanbanRenderProfileLanes(columns){
-  const lanes = _kanbanLaneNames(columns);
-  if (!lanes.length) return columns.map(_kanbanRenderColumn).join('');
+// Generic swim-lane renderer: split `columns` into horizontal lanes keyed by
+// `keyFn(task)`. Used for both profile lanes (key = assignee) and the urgency
+// board's project lanes (key = project).
+function _kanbanRenderLanes(columns, keyFn, labelFn, unassignedKey){
+  const names = new Set();
+  columns.forEach(col => (col.tasks || []).forEach(task => names.add(keyFn(task))));
+  if (!names.size) return columns.map(_kanbanRenderColumn).join('');
+  let lanes = Array.from(names).filter(n => n !== unassignedKey);
+  lanes.sort((a, b) => {
+    if (a === 'default') return -1;
+    if (b === 'default') return 1;
+    return String(a).localeCompare(String(b));
+  });
+  if (names.has(unassignedKey)) lanes.push(unassignedKey);
   return `<div class="kanban-profile-lanes">${lanes.map(lane => {
-    const laneCols = columns.map(col => ({...col, tasks: (col.tasks || []).filter(task => _kanbanLaneKey(task) === lane)}));
+    const laneCols = columns.map(col => ({...col, tasks: (col.tasks || []).filter(task => keyFn(task) === lane)}));
     const count = laneCols.reduce((sum, col) => sum + (col.tasks || []).length, 0);
-    const laneClass = lane === KANBAN_UNASSIGNED_LANE ? ' kanban-profile-lane-unassigned' : '';
-    return `<section class="kanban-profile-lane${laneClass}" data-kanban-lane="${esc(lane)}"><header class="kanban-profile-lane-head"><span>${esc(_kanbanLaneLabel(lane))}</span><span class="kanban-count">${count}</span></header><div class="kanban-board kanban-board-in-lane">${laneCols.map(_kanbanRenderColumn).join('')}</div></section>`;
+    const laneClass = lane === unassignedKey ? ' kanban-profile-lane-unassigned' : '';
+    return `<section class="kanban-profile-lane${laneClass}" data-kanban-lane="${esc(lane)}"><header class="kanban-profile-lane-head"><span>${esc(labelFn(lane))}</span><span class="kanban-count">${count}</span></header><div class="kanban-board kanban-board-in-lane">${laneCols.map(_kanbanRenderColumn).join('')}</div></section>`;
   }).join('')}</div>`;
+}
+
+function _kanbanRenderProfileLanes(columns){
+  return _kanbanRenderLanes(columns, _kanbanLaneKey, _kanbanLaneLabel, KANBAN_UNASSIGNED_LANE);
+}
+
+// --- Urgency × Project board -------------------------------------------------
+// Collapse the raw dispatch statuses into four urgency columns, and lane the
+// cards by the project the AI organizer filed each session under. This is the
+// board a person actually reads: "what needs me / what's running / what's next
+// / what's done", grouped per project.
+const KANBAN_UNSORTED_LANE = 'Unsorted';
+const KANBAN_URGENCY_COLUMNS = [
+  {bucket: 'needs_you', name: 'blocked', label: 'Needs You'},
+  {bucket: 'active',    name: 'running', label: 'Active'},
+  {bucket: 'up_next',   name: 'ready',   label: 'Up Next'},
+  {bucket: 'done',      name: 'done',    label: 'Done'},
+];
+
+function _kanbanProjectLaneKey(task){
+  const p = (task && (task.project || task.project_label) || '').trim();
+  return p || KANBAN_UNSORTED_LANE;
+}
+
+function _kanbanUrgencyBucket(task, status){
+  const s = String((task && task.status) || status || '').toLowerCase();
+  // A session waiting on an answer, or a top-priority item, always demands
+  // attention first — pull it into "Needs You" regardless of raw status.
+  if (s === 'blocked' || (task && task.blocked_question)) return 'needs_you';
+  if (Number(task && task.priority || 0) >= 3) return 'needs_you';
+  if (s === 'running') return 'active';
+  if (s === 'done' || s === 'archived') return 'done';
+  return 'up_next';  // triage / todo / ready / scheduled / review
+}
+
+function _kanbanBuildUrgencyColumns(columns){
+  const buckets = {needs_you: [], active: [], up_next: [], done: []};
+  columns.forEach(col => (col.tasks || []).forEach(task => {
+    const withStatus = {...task, status: task.status || col.name};
+    buckets[_kanbanUrgencyBucket(withStatus, col.name)].push(withStatus);
+  }));
+  // Within a column: unanswered questions first, then priority, then recency.
+  const needsInput = t => (t.blocked_question ? 0 : 1);
+  Object.values(buckets).forEach(list => list.sort((a, b) => {
+    const q = needsInput(a) - needsInput(b); if (q) return q;
+    const p = Number(b.priority || 0) - Number(a.priority || 0); if (p) return p;
+    return Number(b.created_at || 0) - Number(a.created_at || 0);
+  }));
+  return KANBAN_URGENCY_COLUMNS.map(c => ({name: c.name, label: c.label, bucket: c.bucket, tasks: buckets[c.bucket]}));
+}
+
+function _kanbanRenderUrgencyBoard(columns){
+  const urgencyColumns = _kanbanBuildUrgencyColumns(columns);
+  return _kanbanRenderLanes(urgencyColumns, _kanbanProjectLaneKey, lane => lane, KANBAN_UNSORTED_LANE);
 }
 
 function _kanbanEmptyBoardHtml(){
@@ -2577,7 +2663,8 @@ function _kanbanRenderBoard(){
     board.innerHTML = _kanbanEmptyBoardHtml();
     return;
   }
-  board.classList.toggle('kanban-board-consolidated', !_kanbanLanesByProfile);
+  board.classList.toggle('kanban-board-consolidated', !_kanbanLanesByProfile && !_kanbanUrgencyView);
+  board.classList.toggle('kanban-board-urgency', _kanbanUrgencyView);
   const columns = _kanbanVisibleTasks();
   const total = columns.reduce((n, col) => n + (col.tasks || []).length, 0);
   if ($('kanbanSummary')) $('kanbanSummary').textContent = String(t('kanban_visible_tasks')).replace('{0}', total);
@@ -2587,7 +2674,11 @@ function _kanbanRenderBoard(){
     board.innerHTML = unfilteredTotal > 0 ? _kanbanHiddenByFiltersHtml() : _kanbanEmptyBoardHtml();
     return;
   }
-  board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(_kanbanRenderColumn).join('');
+  if (_kanbanUrgencyView) {
+    board.innerHTML = _kanbanRenderUrgencyBoard(columns);
+  } else {
+    board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(_kanbanRenderColumn).join('');
+  }
 }
 
 function _kanbanCard(task, status){
