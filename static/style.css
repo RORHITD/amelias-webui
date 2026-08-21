@@ -132,6 +132,52 @@
   /* ── Skin: Mono (gray) ── */
   :root[data-skin="mono"]{--accent:#666666;--accent-hover:#555555;--accent-bg:rgba(102,102,102,0.08);--accent-bg-strong:rgba(102,102,102,0.15);--accent-text:#555555;}
   :root.dark[data-skin="mono"]{--accent:#CCCCCC;--accent-hover:#999999;--accent-bg:rgba(204,204,204,0.08);--accent-bg-strong:rgba(204,204,204,0.15);--accent-text:#CCCCCC;}
+  /* ── Skin: High Contrast (pure black & white) ──
+     A true monochrome skin: white-on-black in dark, black-on-white in light,
+     with NO colour anywhere in the chrome. Built for maximum legibility in any
+     lighting -- glare, sunlight, or a dark room -- and for low-vision comfort.
+     Status colours stay monochrome too (encoded by weight/brightness, not hue),
+     except error, which keeps a minimal red so destructive states remain
+     distinguishable. Contrast targets exceed WCAG AAA (21:1 body text). */
+  :root[data-skin="hicontrast"]{
+    color-scheme:light;
+    --bg:#FFFFFF;--sidebar:#FFFFFF;--surface:#FFFFFF;--surface-subtle:#F2F2F2;--surface-subtle-hover:#E6E6E6;
+    --border:#000000;--border2:#000000;--border-subtle:#B0B0B0;--border-muted:#6E6E6E;
+    --text:#000000;--strong:#000000;--muted:#3A3A3A;--em:#000000;
+    --accent:#000000;--accent-hover:#2E2E2E;--accent-bg:rgba(0,0,0,0.10);--accent-bg-strong:rgba(0,0,0,0.22);--accent-text:#000000;
+    --blue:#000000;--gold:#000000;--focus-ring:rgba(0,0,0,0.85);--focus-glow:rgba(0,0,0,0.18);
+    --input-bg:#FFFFFF;--hover-bg:rgba(0,0,0,0.09);--code-bg:#F0F0F0;--code-inline-bg:rgba(0,0,0,0.09);--code-text:#000000;--pre-text:#000000;
+    --topbar-bg:#FFFFFF;--main-bg:#FFFFFF;
+    --error:#B00000;--success:#000000;--warning:#000000;--info:#000000;
+    --user-bubble-bg:#000000;--user-bubble-border:#000000;--user-bubble-text:#FFFFFF;--user-bubble-placeholder:#D0D0D0;
+    --user-selection-bg:#000000;--user-selection-text:#FFFFFF;
+  }
+  :root.dark[data-skin="hicontrast"]{
+    color-scheme:dark;
+    --bg:#000000;--sidebar:#000000;--surface:#000000;--surface-subtle:#0D0D0D;--surface-subtle-hover:#1A1A1A;
+    --border:#FFFFFF;--border2:#FFFFFF;--border-subtle:#4A4A4A;--border-muted:#8A8A8A;
+    --text:#FFFFFF;--strong:#FFFFFF;--muted:#C6C6C6;--em:#FFFFFF;
+    --accent:#FFFFFF;--accent-hover:#D6D6D6;--accent-bg:rgba(255,255,255,0.12);--accent-bg-strong:rgba(255,255,255,0.26);--accent-text:#FFFFFF;
+    --blue:#FFFFFF;--gold:#FFFFFF;--focus-ring:rgba(255,255,255,0.90);--focus-glow:rgba(255,255,255,0.20);
+    --input-bg:#000000;--hover-bg:rgba(255,255,255,0.12);--code-bg:#0F0F0F;--code-inline-bg:rgba(255,255,255,0.12);--code-text:#FFFFFF;--pre-text:#FFFFFF;
+    --topbar-bg:#000000;--main-bg:#000000;
+    --error:#FF6B6B;--success:#FFFFFF;--warning:#FFFFFF;--info:#FFFFFF;
+    --user-bubble-bg:#FFFFFF;--user-bubble-border:#FFFFFF;--user-bubble-text:#000000;--user-bubble-placeholder:#3A3A3A;
+    --user-selection-bg:#FFFFFF;--user-selection-text:#000000;
+  }
+  /* High Contrast leans on weight and borders instead of hue, so structure stays
+     readable when every surface is the same two colours. */
+  :root[data-skin="hicontrast"] .kanban-column,
+  :root[data-skin="hicontrast"] .kanban-card,
+  :root[data-skin="hicontrast"] .msg,
+  :root[data-skin="hicontrast"] input,
+  :root[data-skin="hicontrast"] textarea,
+  :root[data-skin="hicontrast"] select,
+  :root[data-skin="hicontrast"] button{border-width:1.5px;}
+  :root[data-skin="hicontrast"] .kanban-column-head,
+  :root[data-skin="hicontrast"] .kanban-profile-lane-head{font-weight:800;letter-spacing:.02em;}
+  :root[data-skin="hicontrast"] :focus-visible{outline:3px solid var(--focus-ring);outline-offset:2px;}
+
   /* ── Skin: Graphite (neutral workbench) ──
      Full palette rewrite with restrained graphite surfaces, soft contrast,
      and neutral action chrome. Uses native system fonts so it stays local,
