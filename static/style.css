@@ -6764,6 +6764,17 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
 .kanban-count{font-size:11px;color:var(--muted);background:var(--input-bg);border:1px solid var(--border);border-radius:999px;padding:1px 7px;}
 .kanban-column-body{display:flex;flex-direction:column;gap:8px;padding:10px;min-height:0;max-height:min(68vh,720px);overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;}
 .kanban-board-consolidated .kanban-column-body{height:100%;max-height:unset;overscroll-behavior:auto;}
+/* Urgency × Project board: colour the four columns so "what needs me" reads at
+   a glance. Accent lives on the column head's top edge; theme-aware via vars. */
+.kanban-board-urgency .kanban-column-head{border-top:3px solid var(--border);border-top-left-radius:10px;border-top-right-radius:10px;}
+.kanban-board-urgency .kanban-column[data-status="blocked"] .kanban-column-head{border-top-color:var(--error,#e5484d);color:var(--error,#e5484d);}
+.kanban-board-urgency .kanban-column[data-status="running"] .kanban-column-head{border-top-color:var(--accent,#3b82f6);}
+.kanban-board-urgency .kanban-column[data-status="ready"] .kanban-column-head{border-top-color:var(--warning,#f5a623);}
+.kanban-board-urgency .kanban-column[data-status="done"] .kanban-column-head{border-top-color:var(--success,#30a46c);}
+.kanban-board-urgency .kanban-column[data-status="done"]{opacity:.82;}
+.kanban-board-urgency .kanban-column[data-status="done"] .kanban-column-body{max-height:min(40vh,420px);}
+/* Project lane header carries a slightly heavier weight so lanes separate. */
+.kanban-board-urgency .kanban-profile-lane-head{font-weight:700;}
 .kanban-card{border:1px solid var(--border);border-radius:9px;background:var(--bg);padding:10px;cursor:pointer;box-shadow:var(--shadow-sm);}
 .kanban-card:hover,.kanban-card.selected{border-color:var(--accent);}
 /* Derived session cards: a dashed edge marks them as projections of a live
