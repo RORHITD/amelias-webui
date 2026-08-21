@@ -281,3 +281,50 @@ def project_for_session(session: dict, *, allow_model: bool = True) -> str:
     cache[key] = {"project": project, "at": int(time.time())}
     _save_cache()
     return project
+
+
+# --- background warming -----------------------------------------------------
+
+import threading
+
+_warm_lock = threading.Lock()
+_warming = False
+
+
+def warm_async(sessions: list | None) -> None:
+    """Classify any uncached sessions in a background thread.
+
+    The board render path reads with ``allow_model=False`` so it never waits on
+    the model; this fills the cache (with the AI's answer) shortly after, so the
+    next render upgrades heuristic labels to AI ones. At most one warm thread
+    runs at a time, and a model that's off/slow just leaves labels as-is.
+    """
+    global _warming
+    if not sessions:
+        return
+    with _warm_lock:
+        if _warming:
+            return
+        _warming = True
+
+    def _run():
+        global _warming
+        try:
+            for s in sessions:
+                if not isinstance(s, dict) or s.get("is_automation"):
+                    continue
+                title = (s.get("title") or "").strip()
+                if not title:
+                    continue
+                sid = str(s.get("session_id") or s.get("id") or "")
+                if _cache_key(sid, title) in _load_cache():
+                    continue
+                try:
+                    project_for_session(s, allow_model=True)
+                except Exception:
+                    pass
+        finally:
+            with _warm_lock:
+                _warming = False
+
+    threading.Thread(target=_run, name="session-organizer-warm", daemon=True).start()
