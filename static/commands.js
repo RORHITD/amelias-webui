@@ -1410,12 +1410,26 @@ function _steerFailureMessageKey(fallback) {
     ? key : 'steer_fail_unknown';
 }
 
+// How long a delivered-steer indicator stays on screen before fading out. The
+// steer has already been handed to the agent by the time this renders, so the
+// indicator is a receipt -- it must not linger or pile up.
+const STEER_INDICATOR_VISIBLE_MS=6000;
+const STEER_INDICATOR_FADE_MS=400;
+
+function _removeSteerIndicator(el){
+  if(!el) return;
+  if(el._steerTimer){clearTimeout(el._steerTimer);el._steerTimer=null;}
+  if(el._steerFadeTimer){clearTimeout(el._steerFadeTimer);el._steerFadeTimer=null;}
+  el.remove();
+}
+
 function _showSteerIndicator(text){
   const inner=document.getElementById('msgInner');
   if(!inner) return;
-  // Remove any existing steer indicator
-  const old=inner.querySelector('.steer-indicator');
-  if(old) old.remove();
+  // Remove EVERY existing indicator, not just the first match. Each steer is a
+  // fresh receipt; leftovers from earlier steers would otherwise stack down the
+  // transcript as more text is submitted.
+  inner.querySelectorAll('.steer-indicator').forEach(_removeSteerIndicator);
   const el=document.createElement('div');
   el.className='steer-indicator';
   const badge=document.createElement('span');
@@ -1423,10 +1437,17 @@ function _showSteerIndicator(text){
   badge.textContent='Steer';
   const body=document.createElement('span');
   body.className='steer-body';
-  body.textContent=text.length>120?text.slice(0,117)+'…':text;
+  body.textContent=text.length>120?text.slice(0,117)+'\u2026':text;
   el.appendChild(badge);
   el.appendChild(body);
   inner.appendChild(el);
+  // Self-expire. The previous code relied on renderMessages() rebuilding
+  // msgInner to clear this, which does not happen on every path -- so the
+  // indicator could sit on screen indefinitely and accumulate per steer.
+  el._steerTimer=setTimeout(()=>{
+    el.classList.add('steer-indicator-out');
+    el._steerFadeTimer=setTimeout(()=>_removeSteerIndicator(el),STEER_INDICATOR_FADE_MS);
+  },STEER_INDICATOR_VISIBLE_MS);
   if(typeof scrollToBottom==='function') scrollToBottom();
 }
 

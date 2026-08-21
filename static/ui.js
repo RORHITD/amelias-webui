@@ -8638,6 +8638,8 @@ function updateQueueBadge(sessionId){
 }
 const TOAST_DEFAULT_MS=2800;
 const TOAST_ERROR_DEFAULT_MS=20000;
+// Extra grace beyond a toast's own duration before the hard-cap sweep fires.
+const TOAST_STUCK_GRACE_MS=8000;
 function clearToastDismissTimer(el){if(!el)return;clearTimeout(el._t);el._t=null;}
 function setToastDismissTimer(el,duration){if(!el)return;clearToastDismissTimer(el);el._t=setTimeout(()=>{el.classList.remove('show');},duration);}
 function dismissToast(btnOrEl){
@@ -8661,12 +8663,24 @@ function showToast(msg,ms,type){
   el.dataset.toastMessage=s;
   if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button><button class="toast-dismiss" type="button" aria-label="Dismiss error toast" data-toast-dismiss="1" onclick="dismissToast(this);event.stopPropagation()">Dismiss</button>`;
   else el.textContent=s;
-  el.onmouseenter=()=>clearToastDismissTimer(el);
-  el.onmouseleave=()=>setToastDismissTimer(el,duration);
+  // Pause-on-hover only where hovering is real. On touch (and when a stray
+  // pointer happens to rest where the toast appears) mouseenter fires but a
+  // matching mouseleave may never arrive, which cancelled the dismiss timer
+  // permanently and left the toast stuck on screen.
+  const _canHover=!(window.matchMedia&&window.matchMedia('(hover: none)').matches);
+  el.onmouseenter=_canHover?(()=>clearToastDismissTimer(el)):null;
+  el.onmouseleave=_canHover?(()=>setToastDismissTimer(el,duration)):null;
   el.onfocusin=()=>clearToastDismissTimer(el);
   el.onfocusout=()=>setToastDismissTimer(el,duration);
   el.onclick=t==='error'?null:()=>dismissToast(el);
   setToastDismissTimer(el,duration);
+  // Hard cap: whatever paused the dismiss timer (hover, focus, a pointer that
+  // never left), a transient toast must not outlive this. Error toasts are
+  // exempt -- they carry Copy/Dismiss and are meant to be read.
+  if(el._toastMaxTimer){clearTimeout(el._toastMaxTimer);el._toastMaxTimer=null;}
+  if(t!=='error'){
+    el._toastMaxTimer=setTimeout(()=>{clearToastDismissTimer(el);el.classList.remove('show');},Math.max(duration,0)+TOAST_STUCK_GRACE_MS);
+  }
 }
 
 // ── Shared app dialogs ───────────────────────────────────────────────────────
