@@ -13411,6 +13411,16 @@ def handle_get(handler, parsed) -> bool:
         from api.session_recovery import audit_session_recovery
         return j(handler, audit_session_recovery(SESSION_DIR, state_db_path=_active_state_db_path()))
 
+    if parsed.path == "/api/inference/progress":
+        # Live prefill/decode phase for a local model server that only logs it.
+        # Fail-soft by contract: never raises, never blocks a chat.
+        try:
+            from api.inference_progress import inference_progress
+
+            return j(handler, inference_progress())
+        except Exception:
+            return j(handler, {"phase": "unknown", "reason": "probe_failed"})
+
     if parsed.path == "/api/session/status":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
         if not sid:
