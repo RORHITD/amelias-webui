@@ -11755,7 +11755,7 @@ def _run_lifecycle_health() -> dict:
 # Checks that are reported but never gate overall health: they describe
 # *other* processes, so failing them must not make a supervisor restart the
 # web UI.
-_INFORMATIONAL_HEALTH_CHECKS = {"model_backend"}
+_INFORMATIONAL_HEALTH_CHECKS = {"model_backend", "model_backends"}
 
 
 def _model_backend_health(timeout_seconds: float = 1.5) -> dict:
@@ -11806,6 +11806,63 @@ def _model_backend_health(timeout_seconds: float = 1.5) -> dict:
             "error": type(exc).__name__,
             "ms": round((time.time() - t0) * 1000, 1),
         }
+
+
+def _probe_one_backend(base_url: str, timeout_seconds: float = 1.5) -> dict:
+    """Liveness for a single OpenAI-compatible base_url."""
+    import urllib.request
+
+    t0 = time.time()
+    url = base_url.rstrip("/")
+    url = url + "/models" if url.endswith("/v1") else url + "/v1/models"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="GET"),
+                                    timeout=timeout_seconds) as resp:
+            code = int(getattr(resp, "status", 200))
+        return {"status": "ok" if 200 <= code < 400 else "error",
+                "base_url": base_url, "http_status": code,
+                "ms": round((time.time() - t0) * 1000, 1)}
+    except Exception as exc:
+        return {"status": "unreachable", "base_url": base_url,
+                "error": type(exc).__name__,
+                "ms": round((time.time() - t0) * 1000, 1)}
+
+
+def _model_backends_health() -> dict:
+    """Liveness for the primary AND every configured fallback.
+
+    With automatic failover configured, knowing the primary is down is only
+    half the picture — what matters is whether *any* backend can still serve.
+    A supervisor or a human debugging "why did my turn fail" needs to see the
+    whole chain, and `any_available` answers the real question directly.
+    """
+    try:
+        from api.config import get_config
+
+        cfg = get_config() or {}
+    except Exception:
+        return {"status": "unknown"}
+
+    out: dict = {}
+    primary = str((cfg.get("model") or {}).get("base_url") or "").strip()
+    if primary:
+        out["primary"] = _probe_one_backend(primary)
+
+    fallbacks = cfg.get("fallback_providers") or []
+    probed = []
+    if isinstance(fallbacks, list):
+        for entry in fallbacks:
+            if not isinstance(entry, dict):
+                continue
+            url = str(entry.get("base_url") or "").strip()
+            if url:
+                probed.append(_probe_one_backend(url))
+    if probed:
+        out["fallbacks"] = probed
+
+    checked = ([out["primary"]] if "primary" in out else []) + probed
+    out["any_available"] = any(c.get("status") == "ok" for c in checked)
+    return out
 
 
 def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
@@ -11887,6 +11944,7 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     # Reporting it helps a human diagnose "why is chat failing", but it must NOT
     # mark the web UI unhealthy -- a supervisor would restart the wrong process.
     checks["model_backend"] = _model_backend_health()
+    checks["model_backends"] = _model_backends_health()
 
     healthy = all(
         check.get("status") in {"ok", "missing"}
