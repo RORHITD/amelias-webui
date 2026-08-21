@@ -11752,6 +11752,12 @@ def _run_lifecycle_health() -> dict:
     return payload
 
 
+# Checks that are reported but never gate overall health: they describe
+# *other* processes, so failing them must not make a supervisor restart the
+# web UI.
+_INFORMATIONAL_HEALTH_CHECKS = {"model_backend"}
+
+
 def _model_backend_health(timeout_seconds: float = 1.5) -> dict:
     """Is the configured model backend actually reachable?
 
@@ -11816,7 +11822,6 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     """
     checks: dict[str, dict] = {}
 
-    checks["model_backend"] = _model_backend_health()
     checks["streams_lock"] = stream_check if stream_check is not None else _streams_lock_health()
     checks["stream_runtime"] = {
         "status": "ok",
@@ -11877,9 +11882,16 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
             "ms": round((time.time() - t0) * 1000, 1),
         }
 
+    # Informational only: the model server living in another process (Ollama,
+    # MLX, llama.cpp) can be down while this web UI is perfectly healthy.
+    # Reporting it helps a human diagnose "why is chat failing", but it must NOT
+    # mark the web UI unhealthy -- a supervisor would restart the wrong process.
+    checks["model_backend"] = _model_backend_health()
+
     healthy = all(
         check.get("status") in {"ok", "missing"}
-        for check in checks.values()
+        for name, check in checks.items()
+        if name not in _INFORMATIONAL_HEALTH_CHECKS
     )
     return checks, healthy
 
