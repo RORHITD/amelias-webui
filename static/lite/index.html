@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<title>Amelia</title>
+<!--
+  Amelia Lite — a deliberately small client for the Hermes backend.
+
+  Why this exists as a SEPARATE client rather than as edits to panels.js:
+  this repo is a fork of nesquena/hermes-webui, and panels.js is ~13.6k lines of
+  upstream code. Editing it toward a new design would create merge conflicts on
+  every upstream pull, forever. These are new files under static/, which the
+  server already serves via its generic /static/ passthrough — so this ships
+  with ZERO changes to any upstream file, and the old UI keeps working untouched.
+
+  Scope is intentionally narrow: sign in, pick a session, talk to the agent.
+  The point is the twenty things done constantly, not parity with a panel system.
+-->
+<style>
+  :root{
+    --bg:#F6F7F9; --surface:#FFFFFF; --surface2:#ECEFF3;
+    --ink:#131A21; --inkSoft:#48596A; --muted:#71828F;
+    --line:#E2E7EC; --accent:#0F7B8A; --accentInk:#FFFFFF;
+    --bubble-me:#0F7B8A; --bubble-me-ink:#FFFFFF;
+    --glass:rgba(255,255,255,.72); --stroke:rgba(255,255,255,.9);
+    --risk:#A03A3A;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#0D1216; --surface:#151D24; --surface2:#1B252E;
+      --ink:#E9EEF3; --inkSoft:#A7B6C4; --muted:#788896;
+      --line:#232F3A; --accent:#4FC3D4; --accentInk:#08131A;
+      --bubble-me:#2C7C89; --bubble-me-ink:#F2FAFC;
+      --glass:rgba(16,23,29,.66); --stroke:rgba(255,255,255,.10);
+      --risk:#E08585;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0D1216; --surface:#151D24; --surface2:#1B252E;
+    --ink:#E9EEF3; --inkSoft:#A7B6C4; --muted:#788896;
+    --line:#232F3A; --accent:#4FC3D4; --accentInk:#08131A;
+    --bubble-me:#2C7C89; --bubble-me-ink:#F2FAFC;
+    --glass:rgba(16,23,29,.66); --stroke:rgba(255,255,255,.10);
+    --risk:#E08585;
+  }
+
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    font-size:16px; line-height:1.55; -webkit-font-smoothing:antialiased;
+    overscroll-behavior-y:none;
+  }
+  button{font:inherit; color:inherit; border:none; background:none; cursor:pointer}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+  /* ---- Collapsing header. Scroll down and it gets out of the way. ---- */
+  #hdr{
+    position:fixed; inset:0 0 auto 0; z-index:40;
+    padding:calc(env(safe-area-inset-top) + 14px) 18px 12px;
+    background:var(--glass); backdrop-filter:blur(18px) saturate(1.6);
+    -webkit-backdrop-filter:blur(18px) saturate(1.6);
+    border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:12px;
+    transition:transform .28s cubic-bezier(.4,0,.2,1), opacity .2s;
+  }
+  #hdr.away{transform:translateY(-102%); opacity:0}
+  #hdr h1{font-size:19px; font-weight:700; letter-spacing:-.02em; margin:0; flex:1}
+  #hdr .sub{font-size:12px; color:var(--muted); font-weight:500; letter-spacing:0}
+  .iconbtn{
+    width:36px; height:36px; border-radius:50%; display:grid; place-items:center;
+    background:var(--surface); border:1px solid var(--line); color:var(--inkSoft);
+  }
+  .iconbtn:active{opacity:.6}
+
+  /* ---- Scrollers ---- */
+  .view{display:none; height:100%; flex-direction:column}
+  .view.on{display:flex}
+  .scroll{
+    flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
+    padding:calc(env(safe-area-inset-top) + 74px) 16px 8px;
+  }
+
+  /* ---- Chat ---- */
+  .msg{margin:0 0 14px; display:flex}
+  .msg.me{justify-content:flex-end}
+  .bub{
+    max-width:min(78%,64ch); padding:11px 14px; border-radius:18px;
+    font-size:15.5px; white-space:pre-wrap; word-wrap:break-word;
+    background:var(--surface); border:1px solid var(--line);
+  }
+  .msg.me .bub{background:var(--bubble-me); color:var(--bubble-me-ink); border-color:transparent; border-bottom-right-radius:6px}
+  .msg.bot .bub{border-bottom-left-radius:6px}
+  .msg.tool .bub{
+    background:var(--surface2); border-style:dashed; color:var(--inkSoft);
+    font-family:ui-monospace,Menlo,monospace; font-size:12.5px; max-width:min(88%,72ch);
+  }
+  .msg.err .bub{border-color:var(--risk); color:var(--risk)}
+  .empty{color:var(--muted); text-align:center; padding:64px 20px; font-size:14.5px}
+  .cursor::after{
+    content:"▍"; color:var(--accent); animation:blink 1s steps(2) infinite;
+  }
+  @keyframes blink{50%{opacity:0}}
+
+  /* ---- Composer, pinned above the floating bar ---- */
+  #composer{
+    position:sticky; bottom:0; padding:8px 16px calc(env(safe-area-inset-bottom) + 104px);
+    background:linear-gradient(to top,var(--bg) 62%,transparent);
+  }
+  .cwrap{
+    display:flex; align-items:flex-end; gap:8px; padding:6px 6px 6px 14px;
+    background:var(--surface); border:1px solid var(--line); border-radius:24px;
+    box-shadow:0 6px 22px rgba(0,0,0,.07);
+  }
+  #inp{
+    flex:1; border:none; outline:none; background:transparent; color:var(--ink);
+    font-size:16px; line-height:1.4; resize:none; max-height:132px; padding:8px 0;
+    font-family:inherit;
+  }
+  #send{
+    width:38px; height:38px; border-radius:50%; background:var(--accent);
+    color:var(--accentInk); display:grid; place-items:center; flex:none;
+    transition:transform .12s, opacity .2s;
+  }
+  #send:disabled{opacity:.35}
+  #send:active:not(:disabled){transform:scale(.9)}
+
+  /* ---- Sessions ---- */
+  .row{
+    display:flex; align-items:center; gap:12px; padding:14px 15px; margin-bottom:9px;
+    background:var(--surface); border:1px solid var(--line); border-radius:13px;
+  }
+  .row:active{opacity:.65}
+  .row .t{flex:1; min-width:0}
+  .row .t b{display:block; font-size:15px; font-weight:620; letter-spacing:-.01em;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .row .t span{font-size:12.5px; color:var(--muted)}
+  .row.sel{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset}
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--accent); flex:none}
+
+  /* ---- Floating glass tab bar (Zellaro idiom): only the active tab is labelled,
+         which is what lets a pill fit real labels without shrinking the type. ---- */
+  #tabs{
+    position:fixed; left:0; right:0; bottom:0; z-index:50;
+    padding:0 16px calc(env(safe-area-inset-bottom) + 12px);
+    display:flex; justify-content:center; pointer-events:none;
+  }
+  .bar{
+    pointer-events:auto; display:flex; gap:4px; padding:6px;
+    background:var(--glass); backdrop-filter:blur(20px) saturate(1.7);
+    -webkit-backdrop-filter:blur(20px) saturate(1.7);
+    border:1px solid var(--stroke); border-radius:999px;
+    box-shadow:0 8px 28px rgba(0,0,0,.16);
+  }
+  .tab{
+    display:flex; align-items:center; gap:7px; height:44px; padding:0 15px;
+    border-radius:999px; color:var(--inkSoft); font-size:14px; font-weight:600;
+    transition:background .2s, color .2s, padding .2s;
+  }
+  .tab .lbl{max-width:0; overflow:hidden; opacity:0; transition:max-width .24s, opacity .18s; white-space:nowrap}
+  .tab.on{background:var(--accent); color:var(--accentInk)}
+  .tab.on .lbl{max-width:110px; opacity:1}
+  .tab svg{flex:none}
+
+  /* ---- Login ---- */
+  #login{
+    position:fixed; inset:0; z-index:80; background:var(--bg);
+    display:none; flex-direction:column; align-items:center; justify-content:center;
+    padding:28px; gap:14px;
+  }
+  #login.on{display:flex}
+  #login h2{font-size:26px; letter-spacing:-.025em; margin:0 0 2px}
+  #login p{color:var(--muted); font-size:14px; margin:0 0 12px; text-align:center}
+  #pw{
+    width:min(340px,100%); padding:13px 15px; font-size:16px; border-radius:12px;
+    background:var(--surface); border:1px solid var(--line); color:var(--ink); outline:none;
+  }
+  #pw:focus{border-color:var(--accent)}
+  #go{
+    width:min(340px,100%); padding:13px; border-radius:12px; font-weight:660;
+    background:var(--accent); color:var(--accentInk);
+  }
+  #lerr{color:var(--risk); font-size:13.5px; min-height:19px}
+  .brand{
+    width:56px; height:56px; border-radius:17px; background:var(--accent);
+    color:var(--accentInk); display:grid; place-items:center;
+    font-weight:800; font-size:23px; letter-spacing:-.03em; margin-bottom:6px;
+  }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <div class="brand">A</div>
+  <h2>Amelia</h2>
+  <p>Sign in to your agent</p>
+  <input id="pw" type="password" placeholder="Password" autocomplete="current-password" aria-label="Password" />
+  <button id="go">Sign in</button>
+  <div id="lerr" role="alert"></div>
+</div>
+
+<header id="hdr">
+  <div style="flex:1;min-width:0">
+    <h1 id="title">Amelia</h1>
+    <div class="sub" id="sub">connecting…</div>
+  </div>
+  <button class="iconbtn" id="themeBtn" aria-label="Toggle theme" title="Theme">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>
+    </svg>
+  </button>
+  <button class="iconbtn" id="newBtn" aria-label="New session" title="New session">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
+      <path d="M12 5v14M5 12h14"/>
+    </svg>
+  </button>
+</header>
+
+<main style="height:100%">
+  <section class="view on" id="v-chat">
+    <div class="scroll" id="chatScroll"><div id="msgs"><div class="empty" id="chatEmpty">Say something to start.</div></div></div>
+    <div id="composer">
+      <div class="cwrap">
+        <textarea id="inp" rows="1" placeholder="Message Amelia…" aria-label="Message"></textarea>
+        <button id="send" aria-label="Send" disabled>
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="v-sessions">
+    <div class="scroll" style="padding-bottom:120px" id="sessScroll"><div id="sessList"></div></div>
+  </section>
+</main>
+
+<nav id="tabs">
+  <div class="bar" role="tablist">
+    <button class="tab on" data-v="chat" role="tab" aria-selected="true">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.9 9.9 0 0 1-4.2-.9L3 20.5l1.6-4.4A8.3 8.3 0 0 1 3.6 11.5a8.4 8.4 0 0 1 9-8.4 8.4 8.4 0 0 1 8.4 8.4Z"/></svg>
+      <span class="lbl">Chat</span>
+    </button>
+    <button class="tab" data-v="sessions" role="tab" aria-selected="false">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      <span class="lbl">Sessions</span>
+    </button>
+  </div>
+</nav>
+
+<script src="app.js"></script>
+</body>
+</html>
