@@ -256,6 +256,7 @@ function setProjView(board) {
 
 async function selectSession(id) {
   state.sid = id;
+  state.lastUsage = null;   // usage is cumulative PER SESSION; reset the baseline
   localStorage.setItem('amelia-lite-sid', id);
   $('msgs').innerHTML = '';
   renderProjectList();
@@ -336,7 +337,11 @@ async function send() {
       try { es.close(); } catch (_) {}
       state.es = null; loadProjects();
     };
-    es.addEventListener('done', finish);
+    es.addEventListener('done', (e) => {
+      // Price the turn before tearing the stream down.
+      try { ledgerRecord(JSON.parse(e.data || '{}').usage, state.model); } catch (_) {}
+      finish();
+    });
     es.addEventListener('stream_end', finish);
     es.addEventListener('error', (e) => {
       let m = ''; try { m = JSON.parse(e.data).message || ''; } catch (_) {}
@@ -542,6 +547,7 @@ async function renderProfile() {
   dEl.appendChild(add);
 
   await renderSkills();
+  await renderUsage();
 }
 
 async function renderSkills() {
@@ -688,6 +694,102 @@ function showLocalForm() {
     } catch (e) { showPromo('Could not connect: ' + e.message); }
   };
   box.scrollIntoView({ block: 'center' });
+}
+
+
+/* ---------- usage ledger ---------- */
+
+/* Hermes already prices every turn: the `done` event carries a cumulative
+   usage object with input/output tokens and estimated_cost. Nothing was
+   recording it, so there was no way to answer "what does a user actually
+   cost?" — which is the number every pricing decision depends on.
+
+   Cumulative per session, so a turn is the delta. Stored locally, capped, and
+   deliberately additive: metering server-side would mean editing upstream. The
+   limitation is real and worth stating — this counts turns made through THIS
+   client only. /api/provider/cost-history remains the authoritative total. */
+const LEDGER_KEY = 'amelia-lite-usage';
+const LEDGER_MAX = 800;
+
+function ledgerRead() {
+  try { return JSON.parse(localStorage.getItem(LEDGER_KEY) || '[]'); } catch (_) { return []; }
+}
+
+function ledgerRecord(usage, model) {
+  if (!usage) return;
+  const prev = state.lastUsage || {};
+  const dIn = Math.max(0, (usage.input_tokens || 0) - (prev.input_tokens || 0));
+  const dOut = Math.max(0, (usage.output_tokens || 0) - (prev.output_tokens || 0));
+  const dCost = Math.max(0, (usage.estimated_cost || 0) - (prev.estimated_cost || 0));
+  state.lastUsage = usage;
+  if (!dIn && !dOut) return;           // no-op turn; do not pad the ledger
+  const rows = ledgerRead();
+  rows.push({ t: Date.now(), m: model || state.model || 'unknown', i: dIn, o: dOut, c: dCost });
+  localStorage.setItem(LEDGER_KEY, JSON.stringify(rows.slice(-LEDGER_MAX)));
+}
+
+const money = (n) => (n >= 1 ? '$' + n.toFixed(2) : n > 0 ? '$' + n.toFixed(4) : '$0.00');
+const compact = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n));
+
+async function renderUsage() {
+  const el = $('pUsage');
+  const rows = ledgerRead();
+  const now = Date.now();
+  const win = (days) => rows.filter((r) => now - r.t < days * 86400000);
+  const sum = (list) => list.reduce((a, r) => ({ i: a.i + r.i, o: a.o + r.o, c: a.c + r.c }), { i: 0, o: 0, c: 0 });
+
+  const d1 = sum(win(1)), d7 = sum(win(7)), d30 = sum(win(30));
+  el.innerHTML = '';
+
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty" style="padding:20px">No turns measured yet.<br>' +
+      'Send a message and this fills in.</div>';
+  } else {
+    const box = document.createElement('div');
+    box.className = 'conn';
+    box.innerHTML =
+      '<div class="top"><b>Measured spend</b><span class="state st-on">' + rows.length + ' turns</span></div>' +
+      '<div class="usegrid">' +
+        '<div><span>Today</span><b>' + money(d1.c) + '</b><i>' + compact(d1.i + d1.o) + ' tok</i></div>' +
+        '<div><span>7 days</span><b>' + money(d7.c) + '</b><i>' + compact(d7.i + d7.o) + ' tok</i></div>' +
+        '<div><span>30 days</span><b>' + money(d30.c) + '</b><i>' + compact(d30.i + d30.o) + ' tok</i></div>' +
+      '</div>' +
+      '<p style="font-size:12.5px;color:var(--ink3)">Counts turns sent from this client. ' +
+      'The provider\'s own dashboard remains the authoritative bill.</p>';
+    el.appendChild(box);
+
+    // Cost per model is the number that decides which provider to standardise
+    // on — cheapest per token is not the same as cheapest per finished task.
+    const byModel = {};
+    win(30).forEach((r) => {
+      byModel[r.m] = byModel[r.m] || { c: 0, n: 0, i: 0, o: 0 };
+      byModel[r.m].c += r.c; byModel[r.m].n += 1;
+      byModel[r.m].i += r.i; byModel[r.m].o += r.o;
+    });
+    Object.entries(byModel).sort((a, b) => b[1].c - a[1].c).forEach(([m, v]) => {
+      const r = document.createElement('div');
+      r.className = 'row';
+      r.innerHTML = '<span class="t"><b></b><span></span></span><span style="font-weight:650">' + money(v.c) + '</span>';
+      r.querySelector('b').textContent = m;
+      r.querySelector('.t span').textContent =
+        v.n + ' turns · ' + money(v.c / Math.max(1, v.n)) + ' per turn · ' + compact(v.i + v.o) + ' tok';
+      el.appendChild(r);
+    });
+  }
+
+  // Server-side total, when the provider reports one. Authoritative, and it
+  // also covers turns taken in the main UI which this client never sees.
+  try {
+    const h = await api('/api/provider/cost-history?days=30');
+    const total = h && (h.total_cost ?? h.total ?? null);
+    if (total != null) {
+      const r = document.createElement('div');
+      r.className = 'row';
+      r.innerHTML = '<span class="t"><b>Provider reported (30d)</b><span>All clients, not just this one</span></span>' +
+        '<span style="font-weight:650">' + money(Number(total)) + '</span>';
+      el.appendChild(r);
+    }
+  } catch (_) {}
 }
 
 /* ---------- Ask AI ---------- */
