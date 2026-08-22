@@ -548,6 +548,7 @@ async function renderProfile() {
 
   await renderSkills();
   await renderUsage();
+  await renderCatalog();
 }
 
 async function renderSkills() {
@@ -790,6 +791,81 @@ async function renderUsage() {
       el.appendChild(r);
     }
   } catch (_) {}
+}
+
+
+/* ---------- model catalogue ---------- */
+
+/* Grouped by JOB rather than by vendor. A beginner picks the work they are
+   doing; which model serves it is an implementation detail. Prices come from a
+   live catalogue (amelia-model-catalog) because a hardcoded price list starts
+   lying within weeks, and a wrong cost figure is worse than no figure. */
+async function renderCatalog() {
+  const el = $('pCatalog');
+  let cat = null;
+  try {
+    const r = await fetch('models.catalog.json', { cache: 'no-store' });
+    if (r.ok) cat = await r.json();
+  } catch (_) {}
+
+  if (!cat || !cat.jobs) {
+    el.innerHTML = '<div class="empty" style="padding:20px">No catalogue yet.<br>Run: amelia-model-catalog</div>';
+    return;
+  }
+
+  // Price the catalogue against THIS user's measured turn, not a generic
+  // 1k-token assumption — the whole point of the ledger is that real turns are
+  // nothing like the example in a pricing page.
+  const rows = ledgerRead();
+  let avgIn = 40000, avgOut = 2000, measured = false;
+  if (rows.length) {
+    avgIn = rows.reduce((a, r) => a + r.i, 0) / rows.length;
+    avgOut = rows.reduce((a, r) => a + r.o, 0) / rows.length;
+    measured = true;
+  }
+  const perTurn = (m) => (avgIn / 1e6) * m.in + (avgOut / 1e6) * m.out;
+
+  el.innerHTML = '';
+  const note = document.createElement('p');
+  note.style.cssText = 'font-size:12.5px;color:var(--ink3);margin:0 0 14px';
+  note.textContent = measured
+    ? 'Cost per turn is estimated from your measured average (' + compact(Math.round(avgIn)) +
+      ' in / ' + compact(Math.round(avgOut)) + ' out).'
+    : 'Cost per turn assumes a typical agent turn until your own usage is measured.';
+  el.appendChild(note);
+
+  for (const j of cat.jobs) {
+    // Rank by what a turn ACTUALLY costs for this user's token mix, not by the
+    // output price the catalogue was sorted on. Agent turns are input-heavy
+    // (tens of thousands in, a couple of thousand out), so a model with a lower
+    // output price can easily cost more per turn — ordering by output price put
+    // the "cheapest" tag on the wrong row.
+    j.models = [...j.models].sort((a, b) => perTurn(a) - perTurn(b));
+    const h = document.createElement('div');
+    h.className = 'projhead';
+    h.innerHTML = '<b></b>';
+    h.querySelector('b').textContent = j.job;
+    el.appendChild(h);
+
+    const why = document.createElement('p');
+    why.style.cssText = 'font-size:13px;color:var(--ink2);margin:-6px 0 10px';
+    why.textContent = j.why;
+    el.appendChild(why);
+
+    j.models.forEach((m, idx) => {
+      const r = document.createElement('button');
+      r.className = 'row';
+      const best = idx === 0 ? '<span class="tagc">cheapest</span>' : '';
+      r.innerHTML = '<span class="t"><b></b><span></span></span>' + best +
+        '<span style="font-weight:650;white-space:nowrap">' + money(perTurn(m)) + '</span>';
+      r.querySelector('b').textContent = m.name;
+      r.querySelector('.t span').textContent =
+        '$' + m.in.toFixed(2) + ' in / $' + m.out.toFixed(2) + ' out per M · ' +
+        Math.round(m.context / 1000) + 'k ctx';
+      r.onclick = () => useModel(m.id, null);
+      el.appendChild(r);
+    });
+  }
 }
 
 /* ---------- Ask AI ---------- */

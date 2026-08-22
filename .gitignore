@@ -85,3 +85,4 @@ docs/ui-ux/review-shots/
 .webui_password
 attachments/
 static/lite/stack.public.json
+static/lite/models.catalog.json
