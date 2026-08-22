@@ -409,6 +409,63 @@ const GUIDE = {
   openai:     { name: 'OpenAI',     unlocks: ['Powers Ask AI recommendations', 'Vision and file understanding', 'A fallback when local models are busy'], alt: 'Local alternative: the models already on your GPU box — free and private.' },
 };
 
+// Rung 1 of the ladder: what we can say with NO permissions granted, because
+// Amelia already runs on this machine. Reads the aggregate file the scanner
+// writes — counts only, never project names or paths, because /static/ is
+// unauthenticated while /api/ is not.
+async function renderStack() {
+  let agg = null;
+  try {
+    const r = await fetch('stack.public.json', { cache: 'no-store' });
+    if (r.ok) agg = await r.json();
+  } catch (_) {}
+
+  const box = document.createElement('div');
+  box.className = 'conn';
+
+  if (!agg || !agg.projects) {
+    box.innerHTML =
+      '<div class="top"><b>Your stack</b><span class="state st-off">Not scanned</span></div>' +
+      '<p>Amelia can read the manifests of the projects already on this machine — ' +
+      'no account connection and no repo access needed. It never opens your source.</p>' +
+      '<div class="act"><button class="btn-s">How to scan</button></div>';
+    box.querySelector('button').onclick = () => showPromo('Run: amelia-stack-scan');
+    return box;
+  }
+
+  const chips = (items) => items.map(([n, c]) => '<span class="chip">' + n + ' ×' + c + '</span>').join('');
+  box.innerHTML =
+    '<div class="top"><b>Your stack</b><span class="state st-on">' + agg.projects + ' projects</span></div>' +
+    '<p style="margin-bottom:8px">Detected from manifests on this machine. No accounts connected yet.</p>' +
+    '<div class="grouplbl" style="margin:14px 0 8px">Frameworks</div><div class="filterbar">' + chips(agg.frameworks.slice(0, 6)) + '</div>' +
+    '<div class="grouplbl" style="margin:14px 0 8px">Deploys to</div><div class="filterbar">' + chips(agg.hosting.slice(0, 6)) + '</div>' +
+    '<div class="grouplbl" style="margin:14px 0 8px">Paid services in code</div><div class="filterbar">' + chips(agg.paid_services.slice(0, 8)) + '</div>';
+
+  // The savings line is the point of all this — but it is an ESTIMATE from
+  // dependency manifests, not from a bill. Say so, and never state a figure
+  // as if it were measured: a migration that lands over budget destroys the
+  // trust that made someone connect in the first place.
+  const host = Object.fromEntries(agg.hosting);
+  const managed = (host['Vercel'] || 0) + (host['Railway'] || 0) + (host['Heroku'] || 0) + (host['Fly.io'] || 0);
+  if (managed >= 3) {
+    const s = document.createElement('div');
+    s.style.cssText = 'margin-top:14px;padding:14px;border-radius:14px;background:var(--surfaceAlt)';
+    s.innerHTML =
+      '<b style="font-size:14.5px">Possible saving</b>' +
+      '<p style="margin-top:6px">' + managed + ' projects target managed hosts (' +
+      [['Vercel', host['Vercel']], ['Railway', host['Railway']], ['Heroku', host['Heroku']], ['Fly.io', host['Fly.io']]]
+        .filter(([, n]) => n).map(([n, c]) => n + ' ×' + c).join(', ') +
+      '). Most of these fit on one small server.</p>' +
+      '<p style="margin-top:8px;font-size:12.5px;color:var(--ink3)">' +
+      'Estimated from code, not from your bills. Connect the accounts to replace this ' +
+      'guess with real numbers — seats and bandwidth often do not move with the compute.</p>' +
+      '<div class="act"><button class="btn-s">Connect billing to check</button></div>';
+    s.querySelector('button').onclick = () => showPromo('Billing connect is not wired up yet.');
+    box.appendChild(s);
+  }
+  return box;
+}
+
 async function renderConnections() {
   const el = $('connList');
   el.innerHTML = '<div class="empty">Checking…</div>';
@@ -419,6 +476,7 @@ async function renderConnections() {
 
   const connected = new Set(providers.map((p) => String(p.name || p.id || p.provider || '').toLowerCase()));
   el.innerHTML = '';
+  el.appendChild(await renderStack());
 
   if (pending.length) {
     const c = document.createElement('div');
