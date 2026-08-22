@@ -1,0 +1,10 @@
+{
+  "name": "Amelia",
+  "short_name": "Amelia",
+  "start_url": "index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#FBFAF8",
+  "theme_color": "#FBFAF8",
+  "orientation": "portrait"
+}

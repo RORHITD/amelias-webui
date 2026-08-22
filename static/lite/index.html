@@ -5,6 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="light" />
 <title>Amelia</title>
+<!-- Added to Home Screen, this runs without Safari's chrome — which matters
+     here because the floating bar sits at the bottom, exactly where Safari's
+     toolbar would otherwise cover it. -->
+<link rel="manifest" href="manifest.json" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Amelia" />
+<meta name="theme-color" content="#FBFAF8" />
 <!--
   Amelia Lite — a small client for the Hermes backend, built to match the
   Zellaro Tile app rather than to approximate it.
