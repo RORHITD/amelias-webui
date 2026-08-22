@@ -1,137 +1,295 @@
 /* Amelia Lite — client logic.
  *
- * Talks to the same HTTP/SSE surface the iOS app uses, so there is no new
- * backend contract to maintain. Everything here is additive: no upstream file
- * is touched, which is what keeps `git pull` from upstream conflict-free.
+ * Drives the same HTTP/SSE surface the iOS app uses, so there is no new backend
+ * contract to keep in step. Everything is additive; no upstream file is touched.
  */
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const state = { sid: null, streaming: false, sessions: [], es: null };
+const state = {
+  sid: null, streaming: false, sessions: [], cards: [], es: null,
+  model: null, files: [], askBusy: false, skillFilter: 'all', skills: [],
+};
 
 /* ---------- transport ---------- */
 
-// Cookies carry the session, so every call is same-origin with credentials.
 async function api(path, opts = {}) {
   const r = await fetch(path, {
     credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
+    headers: opts.body instanceof FormData ? {} : { 'Content-Type': 'application/json' },
     ...opts,
   });
   const txt = await r.text();
   let data = null;
-  try { data = txt ? JSON.parse(txt) : null; } catch (_) { /* non-JSON is fine */ }
+  try { data = txt ? JSON.parse(txt) : null; } catch (_) {}
   if (!r.ok) {
     const e = new Error((data && data.error) || r.statusText || 'request failed');
-    e.status = r.status;
-    throw e;
+    e.status = r.status; throw e;
   }
   return data;
 }
 
+// Endpoints have grown several shapes upstream. Accept the common ones rather
+// than betting on one and silently rendering an empty screen when it differs.
+const listOf = (d, ...keys) => {
+  if (Array.isArray(d)) return d;
+  for (const k of keys) if (d && Array.isArray(d[k])) return d[k];
+  return [];
+};
+
 /* ---------- auth ---------- */
 
 async function checkAuth() {
-  try {
-    const s = await api('/api/auth/status');
-    // auth_enabled false means the server is wide open (its default) — either
-    // way, "can we proceed" is the only question this screen answers.
-    return !s.auth_enabled || s.logged_in;
-  } catch (_) { return false; }
+  try { const s = await api('/api/auth/status'); return !s.auth_enabled || s.logged_in; }
+  catch (_) { return false; }
 }
 
 async function signIn() {
   const pw = $('pw').value;
   if (!pw) return;
-  $('lerr').textContent = '';
-  $('go').disabled = true;
+  $('lerr').textContent = ''; $('go').disabled = true;
   try {
     await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ password: pw }) });
-    $('pw').value = '';
-    $('login').classList.remove('on');
+    $('pw').value = ''; $('login').classList.remove('on');
     await boot();
   } catch (e) {
     $('lerr').textContent = e.message === 'Invalid password' ? 'Wrong password.' : e.message;
-  } finally {
-    $('go').disabled = false;
-  }
+  } finally { $('go').disabled = false; }
 }
 
-/* ---------- sessions ---------- */
+/* ---------- projects ---------- */
 
-async function loadSessions() {
+// A stable colour per project name. Hashing beats a counter because the colour
+// then survives reordering, reloads, and a project appearing on another device.
+const PROJECT_COLORS = ['#B85D43','#2E7D32','#0D8AFF','#7A5AF8','#B4780F','#0F8A8A','#C2405A','#5B6B7C'];
+function projectColor(name) {
+  if (!name) return '#9CA3AF';
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return PROJECT_COLORS[h % PROJECT_COLORS.length];
+}
+
+// The server's AI organiser labels sessions with a project; when that has not
+// run yet, fall back to the workspace folder name, which is what a person would
+// call it anyway.
+function projectOf(s) {
+  return s.project || s.project_label ||
+    ((s.workspace_path || s.cwd || s.workspace || '').split('/').filter(Boolean).pop()) ||
+    'Unsorted';
+}
+
+const updatedAt = (s) => Number(s.last_message_at || s.updated_at || s.created_at || 0);
+
+async function loadProjects() {
+  // Prefer the board: its cards already carry the AI-assigned project label and
+  // the pending question. Fall back to the plain session list if it is absent.
+  let cards = [];
   try {
-    const d = await api('/api/sessions');
-    // The endpoint has grown several shapes upstream; accept the common ones
-    // rather than guessing one and rendering an empty list on mismatch.
-    state.sessions = Array.isArray(d) ? d : (d.sessions || d.items || []);
-  } catch (_) { state.sessions = []; }
-  renderSessions();
-}
+    const b = await api('/api/kanban/board');
+    const cols = listOf(b, 'columns', 'board');
+    cols.forEach((c) => listOf(c, 'tasks').forEach((t) => cards.push({ ...t, status: t.status || c.name })));
+  } catch (_) {}
 
-function sessionTitle(s) {
-  return s.title || s.name || s.summary || (s.workspace ? s.workspace.split('/').pop() : null) || 'Untitled session';
-}
-
-function renderSessions() {
-  const el = $('sessList');
-  if (!state.sessions.length) {
-    el.innerHTML = '<div class="empty">No sessions yet.<br>Tap + to start one.</div>';
-    return;
+  if (!cards.length) {
+    try {
+      const d = await api('/api/sessions');
+      cards = listOf(d, 'sessions', 'items').map((s) => ({
+        id: 'session:' + (s.session_id || s.id),
+        session_id: s.session_id || s.id,
+        title: s.title || 'Untitled session',
+        status: s.agent_state || 'running',
+        blocked_question: s.blocked_question || '',
+        workspace_path: s.cwd || s.workspace,
+        message_count: s.message_count,
+        last_message_at: s.last_message_at, updated_at: s.updated_at, created_at: s.created_at,
+      }));
+    } catch (_) { cards = []; }
   }
+  state.cards = cards.filter((c) => c.session_id);
+  state.sessions = state.cards;
+  renderResume(); renderProjectList(); renderBoard();
+}
+
+function ago(sec) {
+  if (!sec && sec !== 0) return '';
+  const s = Number(sec);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function agoOf(c) {
+  if (c.age_seconds != null) return ago(c.age_seconds);
+  const u = updatedAt(c);
+  return u ? ago(Math.max(0, Date.now() / 1000 - u)) : '';
+}
+
+/* "Pick up where you left off": the most recently touched session, with its
+   pending question if the agent is waiting on one. */
+function renderResume() {
+  const slot = $('resumeSlot');
+  if (!state.cards.length) { slot.innerHTML = ''; return; }
+  const c = [...state.cards].sort((a, b) => updatedAt(b) - updatedAt(a))[0];
+  const proj = projectOf(c);
+  slot.innerHTML = '';
+  const b = document.createElement('button');
+  b.className = 'resume';
+  b.innerHTML =
+    '<div class="k">Pick up where you left off</div>' +
+    '<div class="ttl display"></div><div class="meta"></div>' +
+    (c.blocked_question ? '<div class="q"></div>' : '');
+  b.querySelector('.ttl').textContent = c.title || 'Untitled session';
+  b.querySelector('.meta').textContent = proj + ' · ' + (agoOf(c) || 'no activity yet');
+  if (c.blocked_question) b.querySelector('.q').textContent = '↳ ' + c.blocked_question;
+  b.onclick = () => { selectSession(c.session_id); showView('chat'); };
+  slot.appendChild(b);
+}
+
+function renderProjectList() {
+  const el = $('projList');
+  if (!state.cards.length) { el.innerHTML = '<div class="empty">No sessions yet.<br>Tap + to start one.</div>'; return; }
+
+  const groups = new Map();
+  for (const c of state.cards) {
+    const p = projectOf(c);
+    if (!groups.has(p)) groups.set(p, []);
+    groups.get(p).push(c);
+  }
+  // Projects ordered by their freshest session; sessions newest first inside.
+  const ordered = [...groups.entries()]
+    .map(([name, list]) => [name, list.sort((a, b) => updatedAt(b) - updatedAt(a))])
+    .sort((a, b) => updatedAt(b[1][0]) - updatedAt(a[1][0]));
+
   el.innerHTML = '';
-  for (const s of state.sessions) {
-    const id = s.session_id || s.id;
-    const row = document.createElement('button');
-    row.className = 'row' + (id === state.sid ? ' sel' : '');
-    row.innerHTML =
-      '<span class="dot" style="' + (id === state.sid ? '' : 'opacity:.22') + '"></span>' +
-      '<span class="t"><b></b><span></span></span>';
-    row.querySelector('b').textContent = sessionTitle(s);
-    row.querySelector('.t span').textContent = s.workspace || id || '';
-    row.onclick = () => { selectSession(id); showView('chat'); };
-    el.appendChild(row);
+  for (const [name, list] of ordered) {
+    const h = document.createElement('div');
+    h.className = 'projhead';
+    h.innerHTML = '<span class="pdot"></span><b></b><span></span>';
+    h.querySelector('.pdot').style.background = projectColor(name);
+    h.querySelector('b').textContent = name;
+    h.querySelector('.projhead span:last-child').textContent =
+      list.length + (list.length === 1 ? ' session' : ' sessions');
+    el.appendChild(h);
+
+    for (const c of list) {
+      const r = document.createElement('button');
+      r.className = 'row' + (c.session_id === state.sid ? ' sel' : '');
+      r.innerHTML = '<span class="t"><b></b><span></span></span><span class="chev">›</span>';
+      r.querySelector('b').textContent = c.title || 'Untitled session';
+      const bits = [agoOf(c)];
+      if (c.blocked_question) bits.unshift('Needs you');
+      else if (String(c.status).toLowerCase() === 'running') bits.unshift('Working');
+      if (c.message_count) bits.push(c.message_count + ' msgs');
+      r.querySelector('.t span').textContent = bits.filter(Boolean).join(' · ');
+      r.onclick = () => { selectSession(c.session_id); showView('chat'); };
+      el.appendChild(r);
+    }
   }
+}
+
+/* The board is the same sessions re-sorted by what they need from you. Bucket
+   rules mirror the existing web UI (_kanbanUrgencyBucket) so the two agree. */
+const BUCKETS = [
+  { key: 'needs_you', label: 'Needs you' },
+  { key: 'active',    label: 'Active' },
+  { key: 'up_next',   label: 'Up next' },
+  { key: 'done',      label: 'Done' },
+];
+function bucketOf(c) {
+  const s = String(c.status || '').toLowerCase();
+  if (s === 'blocked' || c.blocked_question) return 'needs_you';
+  if (Number(c.priority || 0) >= 3) return 'needs_you';
+  if (s === 'running') return 'active';
+  if (s === 'done' || s === 'archived') return 'done';
+  return 'up_next';
+}
+
+function renderBoard() {
+  const el = $('projBoard');
+  if (!state.cards.length) { el.innerHTML = '<div class="empty">Nothing on the board yet.</div>'; return; }
+  const by = { needs_you: [], active: [], up_next: [], done: [] };
+  state.cards.forEach((c) => by[bucketOf(c)].push(c));
+  // Unanswered questions first, then most recent.
+  Object.values(by).forEach((l) => l.sort((a, b) => {
+    const q = (a.blocked_question ? 0 : 1) - (b.blocked_question ? 0 : 1);
+    return q || updatedAt(b) - updatedAt(a);
+  }));
+
+  el.innerHTML = '<div class="board" id="boardCols"></div>';
+  const cols = $('boardCols');
+  for (const b of BUCKETS) {
+    const col = document.createElement('div');
+    col.className = 'col';
+    col.innerHTML = '<div class="colhead"><b></b><span class="n"></span></div><div class="cards"></div>';
+    col.querySelector('b').textContent = b.label;
+    col.querySelector('.n').textContent = by[b.key].length;
+    const host = col.querySelector('.cards');
+    if (!by[b.key].length) {
+      const e = document.createElement('div');
+      e.className = 'empty'; e.style.padding = '26px 8px'; e.style.fontSize = '13.5px';
+      e.textContent = b.key === 'needs_you' ? 'Nothing waiting on you.' : 'Empty';
+      host.appendChild(e);
+    }
+    for (const c of by[b.key]) {
+      const proj = projectOf(c);
+      const card = document.createElement('button');
+      card.className = 'card';
+      card.style.borderLeftColor = projectColor(proj);
+      card.innerHTML = '<b></b><div class="m"></div>' + (c.blocked_question ? '<div class="q"></div>' : '');
+      card.querySelector('b').textContent = c.title || 'Untitled session';
+      card.querySelector('.m').textContent = proj + ' · ' + (agoOf(c) || '—');
+      if (c.blocked_question) card.querySelector('.q').textContent = '↳ ' + c.blocked_question;
+      card.onclick = () => { selectSession(c.session_id); showView('chat'); };
+      host.appendChild(card);
+    }
+    cols.appendChild(col);
+  }
+}
+
+function setProjView(board) {
+  $('segList').classList.toggle('on', !board);
+  $('segBoard').classList.toggle('on', board);
+  $('projList').style.display = board ? 'none' : '';
+  $('projBoard').style.display = board ? '' : 'none';
+  localStorage.setItem('amelia-lite-projview', board ? 'board' : 'list');
 }
 
 async function selectSession(id) {
   state.sid = id;
   localStorage.setItem('amelia-lite-sid', id);
   $('msgs').innerHTML = '';
-  renderSessions();
+  renderProjectList();
 }
 
 async function newSession() {
   try {
-    const d = await api('/api/session/new', {
-      method: 'POST',
-      body: JSON.stringify({ workspace: null, worktree: false }),
-    });
+    const d = await api('/api/session/new', { method: 'POST', body: JSON.stringify({ workspace: null, worktree: false }) });
     const id = d.session_id || d.id || (d.session && d.session.session_id);
-    if (id) { await loadSessions(); await selectSession(id); showView('chat'); }
-  } catch (e) {
-    addMsg('err', 'Could not start a session: ' + e.message);
-  }
+    if (id) { await loadProjects(); await selectSession(id); showView('chat'); }
+  } catch (e) { addMsg('err', 'Could not start a session: ' + e.message); }
 }
 
 /* ---------- chat ---------- */
 
-function addMsg(kind, text) {
-  $('chatEmpty') && $('chatEmpty').remove();
+function addMsg(kind, text, host) {
+  const parent = host || $('msgs');
+  const e = $('chatEmpty'); if (e && !host) e.remove();
   const wrap = document.createElement('div');
   wrap.className = 'msg ' + kind;
   const b = document.createElement('div');
-  b.className = 'bub';
-  b.textContent = text;
-  wrap.appendChild(b);
-  $('msgs').appendChild(wrap);
-  scrollDown();
+  b.className = 'bub'; b.textContent = text;
+  wrap.appendChild(b); parent.appendChild(wrap);
+  scrollDown(host ? 'askScroll' : 'chatScroll');
   return b;
 }
+function scrollDown(id) { const s = $(id || 'chatScroll'); if (s) s.scrollTop = s.scrollHeight; }
 
-function scrollDown() {
-  const s = $('chatScroll');
-  s.scrollTop = s.scrollHeight;
+async function loadModel() {
+  try {
+    const d = await api('/api/default-model');
+    state.model = d.model || d.default || d.name || null;
+  } catch (_) {}
+  $('mdlName').textContent = state.model || 'model not set';
 }
 
 async function send() {
@@ -139,165 +297,311 @@ async function send() {
   if (!text || state.streaming) return;
   if (!state.sid) { await newSession(); if (!state.sid) return; }
 
-  $('inp').value = '';
-  autoGrow();
+  $('inp').value = ''; autoGrow();
   addMsg('me', text);
   setStreaming(true);
 
-  let bubble = null;
-  let acc = '';
-
+  let bubble = null, acc = '', thinkBubble = null, think = '';
   try {
-    const d = await api('/api/chat/start', {
-      method: 'POST',
-      body: JSON.stringify({ session_id: state.sid, message: text, profile: 'default' }),
-    });
+    const body = { session_id: state.sid, message: text, profile: 'default' };
+    if (state.files.length) body.attachments = state.files;
+    const d = await api('/api/chat/start', { method: 'POST', body: JSON.stringify(body) });
+    state.files = []; renderFiles();
+
     const streamId = d.stream_id || d.streamId;
     if (!streamId) throw new Error('server did not return a stream id');
 
     const es = new EventSource('/api/chat/stream?stream_id=' + encodeURIComponent(streamId), { withCredentials: true });
     state.es = es;
 
-    // Assistant text arrives as `token` events carrying {text}. Append into one
-    // bubble rather than creating a node per token.
     es.addEventListener('token', (e) => {
-      let t = '';
-      try { t = JSON.parse(e.data).text || ''; } catch (_) { return; }
+      let t = ''; try { t = JSON.parse(e.data).text || ''; } catch (_) { return; }
       if (!bubble) { bubble = addMsg('bot', ''); bubble.classList.add('cursor'); }
-      acc += t;
-      bubble.textContent = acc;
-      scrollDown();
+      acc += t; bubble.textContent = acc; scrollDown();
     });
-
-    // Tool activity is shown, quietly, because a silent gap while the agent
-    // works reads as a hang.
+    es.addEventListener('reasoning', (e) => {
+      let t = ''; try { const d2 = JSON.parse(e.data); t = d2.text || d2.reasoning || ''; } catch (_) { return; }
+      if (!thinkBubble) thinkBubble = addMsg('think', '');
+      think += t; thinkBubble.textContent = think; scrollDown();
+    });
     es.addEventListener('tool', (e) => {
-      let n = 'working…';
-      try { const d2 = JSON.parse(e.data); n = d2.name || d2.tool || n; } catch (_) {}
-      addMsg('tool', '⚙ ' + n);
+      let n = 'working'; try { const d2 = JSON.parse(e.data); n = d2.name || d2.tool || n; } catch (_) {}
+      addMsg('tool', n);
     });
+    es.addEventListener('approval', () => { loadApprovalCount(); showPromo('Amelia needs your approval'); });
 
     const finish = () => {
       if (bubble) bubble.classList.remove('cursor');
       setStreaming(false);
       try { es.close(); } catch (_) {}
-      state.es = null;
-      loadSessions();
+      state.es = null; loadProjects();
     };
     es.addEventListener('done', finish);
     es.addEventListener('stream_end', finish);
     es.addEventListener('error', (e) => {
-      let m = '';
-      try { m = JSON.parse(e.data).message || ''; } catch (_) {}
+      let m = ''; try { m = JSON.parse(e.data).message || ''; } catch (_) {}
       if (m) addMsg('err', m);
       finish();
     });
-    // A dropped connection fires onerror with no data; don't leave the UI stuck.
     es.onerror = () => { if (state.streaming && es.readyState === EventSource.CLOSED) finish(); };
-  } catch (e) {
-    addMsg('err', e.message);
-    setStreaming(false);
-  }
+  } catch (e) { addMsg('err', e.message); setStreaming(false); }
 }
 
 function setStreaming(on) {
   state.streaming = on;
   $('send').disabled = on || !$('inp').value.trim();
-  // Zellaro's terracotta strip is the app's one "something is happening" slot,
-  // so agent activity reuses it rather than inventing a second status area.
+  $('mdlState').textContent = on ? 'thinking…' : 'idle';
   showPromo(on ? 'Amelia is working…' : null);
 }
 
 function showPromo(text) {
   const el = $('promo');
-  if (!text) { el.classList.remove('on'); document.querySelectorAll('.scroll').forEach(s=>s.classList.remove('promoOn')); return; }
-  $('promoTxt').textContent = text;
-  el.classList.add('on');
-  document.querySelectorAll('.scroll').forEach(s=>s.classList.add('promoOn'));
+  if (!text) { el.classList.remove('on'); document.querySelectorAll('.scroll').forEach((s) => s.classList.remove('promoOn')); return; }
+  $('promoTxt').textContent = text; el.classList.add('on');
+  document.querySelectorAll('.scroll').forEach((s) => s.classList.add('promoOn'));
 }
 
-/* ---------- skills / approvals / profile ---------- */
+function renderFiles() {
+  const el = $('files'); el.innerHTML = '';
+  state.files.forEach((f) => {
+    const c = document.createElement('span');
+    c.className = 'chipf'; c.textContent = (f.name || f) + '';
+    el.appendChild(c);
+  });
+}
+
+async function pickFiles(ev) {
+  const list = [...(ev.target.files || [])];
+  if (!list.length) return;
+  for (const f of list) {
+    const fd = new FormData(); fd.append('file', f);
+    try {
+      const d = await api('/api/upload', { method: 'POST', body: fd });
+      state.files.push({ name: f.name, path: d.path || d.id || d.url });
+    } catch (_) {
+      addMsg('err', 'Upload failed for ' + f.name);
+    }
+  }
+  renderFiles(); ev.target.value = '';
+}
+
+/* ---------- approvals count ---------- */
+
+async function loadApprovalCount() {
+  let n = 0;
+  try { n = listOf(await api('/api/approval/pending'), 'pending', 'approvals', 'items').length; } catch (_) {}
+  for (const id of ['hdrBadge', 'tabBadge']) {
+    const b = $(id); b.textContent = n; b.style.display = n > 0 ? 'grid' : 'none';
+  }
+}
+
+/* ---------- connections ---------- */
+
+// The point of this screen is not a status list — it is teaching what each
+// connection makes possible, and naming a self-hostable alternative so the
+// choice is informed rather than defaulted.
+const GUIDE = {
+  cloudflare: { name: 'Cloudflare', unlocks: ['DNS and zones managed for you', 'R2 object storage for uploads and backups', 'Workers for edge APIs and gateways'], alt: 'Self-hosted alternative: Caddy or Traefik for routing, MinIO for S3-style storage.' },
+  hetzner:    { name: 'Hetzner',    unlocks: ['Cheap always-on servers for agents and databases', 'Volumes and snapshots for backups', 'Runs anything a container can run'], alt: 'Alternatives: OVH or Netcup for similar pricing; your own hardware if it is already on.' },
+  railway:    { name: 'Railway',    unlocks: ['Push-to-deploy web services', 'Managed Postgres and Redis', 'Cron jobs without a server to babysit'], alt: 'Self-hosted alternative: Coolify or Dokploy on a Hetzner box — same workflow, flat cost.' },
+  vercel:     { name: 'Vercel',     unlocks: ['Next.js hosting with preview deploys', 'Edge functions and image optimisation'], alt: 'Self-hosted alternative: Coolify, or Next.js standalone behind Caddy.' },
+  github:     { name: 'GitHub',     unlocks: ['Read and write your repos', 'Open PRs and read CI results', 'Deploy keys scoped to one repo'], alt: 'Self-hosted alternative: Forgejo or Gitea.' },
+  openai:     { name: 'OpenAI',     unlocks: ['Powers Ask AI recommendations', 'Vision and file understanding', 'A fallback when local models are busy'], alt: 'Local alternative: the models already on your GPU box — free and private.' },
+};
+
+async function renderConnections() {
+  const el = $('connList');
+  el.innerHTML = '<div class="empty">Checking…</div>';
+
+  let providers = [], pending = [];
+  try { providers = listOf(await api('/api/providers'), 'providers', 'items'); } catch (_) {}
+  try { pending = listOf(await api('/api/approval/pending'), 'pending', 'approvals', 'items'); } catch (_) {}
+
+  const connected = new Set(providers.map((p) => String(p.name || p.id || p.provider || '').toLowerCase()));
+  el.innerHTML = '';
+
+  if (pending.length) {
+    const c = document.createElement('div');
+    c.className = 'conn';
+    c.innerHTML = '<div class="top"><b>Waiting on you</b><span class="state st-need">' + pending.length + ' pending</span></div>' +
+      '<p>Amelia has paused until you approve these.</p>';
+    el.appendChild(c);
+    pending.forEach((a) => {
+      const r = document.createElement('div');
+      r.className = 'conn';
+      r.innerHTML = '<div class="top"><b></b><span class="state st-need">Approve</span></div><p></p>';
+      r.querySelector('b').textContent = a.title || a.tool || 'Approval needed';
+      r.querySelector('p').textContent = (a.command || a.detail || '').slice(0, 220);
+      el.appendChild(r);
+    });
+  }
+
+  for (const key of Object.keys(GUIDE)) {
+    const g = GUIDE[key];
+    const on = connected.has(key);
+    const c = document.createElement('div');
+    c.className = 'conn';
+    c.innerHTML =
+      '<div class="top"><b></b><span class="state ' + (on ? 'st-on' : 'st-off') + '">' + (on ? 'Connected' : 'Not connected') + '</span></div>' +
+      '<ul class="unlocks">' + g.unlocks.map(() => '<li></li>').join('') + '</ul>' +
+      '<div class="alt"></div>' +
+      '<div class="act"><button class="' + (on ? 'btn-g' : 'btn-s') + '">' + (on ? 'Disconnect' : 'Connect') + '</button></div>';
+    c.querySelector('b').textContent = g.name;
+    c.querySelectorAll('.unlocks li').forEach((li, i) => { li.textContent = g.unlocks[i]; });
+    c.querySelector('.alt').textContent = g.alt;
+    c.querySelector('.act button').onclick = () => {
+      showPromo(on ? 'Disconnecting is not wired up yet.' : 'Connecting ' + g.name + ' is not wired up yet.');
+    };
+    el.appendChild(c);
+  }
+}
+
+/* ---------- profile ---------- */
+
+async function renderProfile() {
+  $('pMail').textContent = location.hostname || 'this device';
+  $('pState').textContent = state.streaming ? 'Working' : 'Connected';
+  $('themeVal').textContent = document.documentElement.getAttribute('data-theme') === 'dark' ? 'Dark' : 'Light';
+
+  // AI models
+  const mEl = $('pModels'); mEl.innerHTML = '';
+  let models = [];
+  try { models = listOf(await api('/api/models'), 'models', 'items'); } catch (_) {}
+  if (!models.length) mEl.innerHTML = '<div class="empty" style="padding:22px">No models reported.</div>';
+  models.slice(0, 12).forEach((m) => {
+    const name = m.id || m.name || m.model || String(m);
+    const r = document.createElement('div');
+    r.className = 'row';
+    r.innerHTML = '<span class="t"><b></b><span></span></span><span class="dis">Disconnect</span>';
+    r.querySelector('b').textContent = name;
+    r.querySelector('.t span').textContent = (m.provider || m.owned_by || 'local') + (name === state.model ? ' · in use' : '');
+    r.querySelector('.dis').onclick = () => showPromo('Disconnecting models is not wired up yet.');
+    mEl.appendChild(r);
+  });
+
+  // Devices — the two machines the brain and vault already span.
+  const dEl = $('pDevices'); dEl.innerHTML = '';
+  [['This device', location.hostname || 'browser', true],
+   ['GPU box', 'tailnet · always on', true]].forEach(([n, sub, ok]) => {
+    const r = document.createElement('div');
+    r.className = 'row';
+    r.innerHTML = '<span class="t"><b></b><span></span></span><span class="dis">Disconnect</span>';
+    r.querySelector('b').textContent = n;
+    r.querySelector('.t span').textContent = sub;
+    r.querySelector('.dis').onclick = () => showPromo('Device management is not wired up yet.');
+    dEl.appendChild(r);
+  });
+  const add = document.createElement('button');
+  add.className = 'row';
+  add.innerHTML = '<span class="t"><b>Add a device</b><span>Pair another machine or phone</span></span><span class="chev">›</span>';
+  add.onclick = () => showPromo('Pairing is not wired up yet.');
+  dEl.appendChild(add);
+
+  await renderSkills();
+}
 
 async function renderSkills() {
-  const el = $('skillList');
-  if (el.dataset.loaded) return;
-  el.innerHTML = '<div class="empty">Loading…</div>';
-  let items = [];
-  try {
-    const d = await api('/api/skills');
-    items = Array.isArray(d) ? d : (d.skills || d.items || []);
-  } catch (_) { items = []; }
-  if (!items.length) { el.innerHTML = '<div class="empty">No skills installed.</div>'; return; }
-  el.innerHTML = '';
-  for (const s of items.slice(0, 60)) {
+  if (!state.skills.length) {
+    try { state.skills = listOf(await api('/api/skills'), 'skills', 'items'); } catch (_) { state.skills = []; }
+  }
+  const fEl = $('skillFilter');
+  if (!fEl.dataset.built) {
+    [['all', 'Most used'], ['az', 'A–Z']].forEach(([k, label]) => {
+      const b = document.createElement('button');
+      b.className = 'chip' + (state.skillFilter === k ? ' on' : '');
+      b.textContent = label;
+      b.onclick = () => { state.skillFilter = k; fEl.dataset.built = ''; fEl.innerHTML = ''; renderSkills(); };
+      fEl.appendChild(b);
+    });
+    fEl.dataset.built = '1';
+  }
+
+  const el = $('pSkills'); el.innerHTML = '';
+  let list = [...state.skills];
+  // "Most used" is a real ordering when the server reports a count, and an
+  // honest fallback to A–Z when it does not — rather than a fake ranking.
+  if (state.skillFilter === 'az') list.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+  else list.sort((a, b) => Number(b.uses || b.use_count || 0) - Number(a.uses || a.use_count || 0)
+    || String(a.name || '').localeCompare(String(b.name || '')));
+
+  if (!list.length) { el.innerHTML = '<div class="empty" style="padding:22px">No skills installed.</div>'; return; }
+  list.slice(0, 40).forEach((s) => {
     const r = document.createElement('div');
     r.className = 'row';
     r.innerHTML = '<span class="t"><b></b><span></span></span>';
     r.querySelector('b').textContent = s.name || s.id || 'skill';
-    r.querySelector('.t span').textContent = (s.description || '').slice(0, 90);
-    el.appendChild(r);
-  }
-  el.dataset.loaded = '1';
-}
-
-async function loadApprovals() {
-  const el = $('inboxList');
-  let items = [];
-  try {
-    const d = await api('/api/approval/pending');
-    items = Array.isArray(d) ? d : (d.pending || d.approvals || d.items || []);
-  } catch (_) { items = []; }
-  setBadge(items.length);
-  if (!items.length) { el.innerHTML = '<div class="empty">Nothing waiting on you.</div>'; return; }
-  el.innerHTML = '';
-  for (const a of items) {
-    const r = document.createElement('div');
-    r.className = 'row';
-    r.innerHTML = '<span class="t"><b></b><span></span></span>';
-    r.querySelector('b').textContent = a.title || a.tool || 'Approval needed';
-    r.querySelector('.t span').textContent = (a.command || a.detail || '').slice(0, 100);
-    el.appendChild(r);
-  }
-}
-
-function setBadge(n) {
-  for (const id of ['hdrBadge', 'tabBadge']) {
-    const b = $(id);
-    b.textContent = n;
-    b.style.display = n > 0 ? 'grid' : 'none';
-  }
-}
-
-function renderProfile() {
-  const host = location.hostname || 'this device';
-  $('pMail').textContent = host;
-  $('pState').textContent = state.streaming ? 'Working' : 'Connected';
-  $('pDot').style.background = 'var(--success)';
-  $('themeVal').textContent =
-    document.documentElement.getAttribute('data-theme') === 'dark' ? 'Dark' : 'Light';
-
-  const el = $('pAgent');
-  el.innerHTML = '';
-  const rows = [
-    ['Sessions', state.sessions.length + ' open'],
-    ['Active session', state.sid ? state.sid.slice(0, 18) + '…' : 'none selected'],
-    ['New session', 'Start a fresh workspace'],
-  ];
-  rows.forEach(([t, sub], i) => {
-    const r = document.createElement('button');
-    r.className = 'row';
-    r.innerHTML = '<span class="t"><b></b><span></span></span><span class="chev">\u203a</span>';
-    r.querySelector('b').textContent = t;
-    r.querySelector('.t span').textContent = sub;
-    if (i === 0) r.onclick = () => showView('sessions');
-    if (i === 2) r.onclick = () => newSession();
+    const uses = Number(s.uses || s.use_count || 0);
+    r.querySelector('.t span').textContent = (uses ? uses + ' uses · ' : '') + String(s.description || '').slice(0, 70);
     el.appendChild(r);
   });
 }
 
+/* ---------- Ask AI ---------- */
+
+const SUGGESTIONS = [
+  'What could I self-host instead of what I pay for?',
+  'Which local model fits my GPU box for planning work?',
+  'Where is my stack fragile right now?',
+];
+
+function renderAskSuggestions() {
+  const el = $('askSugg');
+  if (el.dataset.built) return;
+  SUGGESTIONS.forEach((q) => {
+    const b = document.createElement('button');
+    b.textContent = q;
+    b.onclick = () => { $('askInp').value = q; askGrow(); askSend(); };
+    el.appendChild(b);
+  });
+  el.dataset.built = '1';
+}
+
+// Ask AI runs through the same agent backend, but framed as advice and
+// explicitly told not to touch anything. It is a different mode, not a
+// different engine — so there is no second integration to maintain.
+async function askSend() {
+  const text = $('askInp').value.trim();
+  if (!text || state.askBusy) return;
+  $('askInp').value = ''; askGrow();
+  addMsg('me', text, $('askMsgs'));
+  state.askBusy = true; $('askSend').disabled = true; $('askState').textContent = 'thinking…';
+  $('askSugg').style.display = 'none';
+
+  const framing =
+    'You are advising on this developer\'s stack. Answer with concrete options, ' +
+    'including self-hostable and open-source alternatives, and say plainly when ' +
+    'a paid service is genuinely the better choice. Do not run commands or change anything.\n\n';
+
+  try {
+    const s = await api('/api/session/new', { method: 'POST', body: JSON.stringify({ workspace: null, worktree: false }) });
+    const sid = s.session_id || s.id;
+    const d = await api('/api/chat/start', { method: 'POST', body: JSON.stringify({ session_id: sid, message: framing + text, profile: 'default' }) });
+    const streamId = d.stream_id || d.streamId;
+    const es = new EventSource('/api/chat/stream?stream_id=' + encodeURIComponent(streamId), { withCredentials: true });
+    let bub = null, acc = '';
+    es.addEventListener('token', (e) => {
+      let t = ''; try { t = JSON.parse(e.data).text || ''; } catch (_) { return; }
+      if (!bub) { bub = addMsg('bot', '', $('askMsgs')); bub.classList.add('cursor'); }
+      acc += t; bub.textContent = acc; scrollDown('askScroll');
+    });
+    const done = () => {
+      if (bub) bub.classList.remove('cursor');
+      state.askBusy = false; $('askSend').disabled = !$('askInp').value.trim();
+      $('askState').textContent = 'idle';
+      try { es.close(); } catch (_) {}
+    };
+    es.addEventListener('done', done);
+    es.addEventListener('stream_end', done);
+    es.onerror = () => { if (es.readyState === EventSource.CLOSED) done(); };
+  } catch (e) {
+    addMsg('err', e.message, $('askMsgs'));
+    state.askBusy = false; $('askSend').disabled = false; $('askState').textContent = 'idle';
+  }
+}
+
 /* ---------- chrome ---------- */
 
-const TITLES = { chat:'Amelia', sessions:'Sessions', skills:'Skills', profile:'Profile', inbox:'Approvals' };
+const TITLES = { chat: 'Amelia', projects: 'Projects', ask: 'Ask AI', conn: 'Connect', profile: 'Profile' };
 
 function showView(v) {
   document.querySelectorAll('.view').forEach((s) => s.classList.toggle('on', s.id === 'v-' + v));
@@ -306,29 +610,26 @@ function showView(v) {
     t.classList.toggle('on', on);
     t.setAttribute('aria-selected', on ? 'true' : 'false');
   });
-  // The wordmark carries the section name, the way Zellaro's does.
   $('wordmark').textContent = TITLES[v] || 'Amelia';
   $('hdr').classList.remove('away');
-  if (v === 'sessions') loadSessions();
-  if (v === 'skills') renderSkills();
+  $('bar').classList.remove('compact');
+  if (v === 'projects') loadProjects();
+  if (v === 'conn') renderConnections();
   if (v === 'profile') renderProfile();
-  if (v === 'inbox') loadApprovals();
+  if (v === 'ask') renderAskSuggestions();
 }
 
-// Scrolling down means reading — give the pixels back. Scrolling up means
-// reaching for a control, so the header returns. The threshold stops iOS
-// rubber-band bounce from flickering it.
 function wireChrome() {
   let last = 0;
   const THRESH = 10, TOP = 50;
   document.querySelectorAll('.scroll').forEach((sc) => {
     sc.addEventListener('scroll', () => {
       const y = sc.scrollTop, d = y - last;
-      if (y < TOP) { $('hdr').classList.remove('away'); last = y; return; }
+      if (y < TOP) { $('hdr').classList.remove('away'); $('bar').classList.remove('compact'); last = y; return; }
       if (Math.abs(d) < THRESH) return;
       $('hdr').classList.toggle('away', d > 0);
-      // The bar tightens to icons-only rather than vanishing, so the primary
-      // control never leaves the screen while reading.
+      // The bar tightens rather than leaving, so the primary control is always
+      // reachable while reading.
       $('bar').classList.toggle('compact', d > 0);
       last = y;
     }, { passive: true });
@@ -337,26 +638,29 @@ function wireChrome() {
 
 function autoGrow() {
   const t = $('inp');
-  t.style.height = 'auto';
-  t.style.height = Math.min(t.scrollHeight, 132) + 'px';
+  t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 128) + 'px';
   $('send').disabled = state.streaming || !t.value.trim();
 }
-
-// Light is the default and is set explicitly — the page must not inherit the
-// OS's dark preference, because this design is specified as the white one.
-function applyTheme(t) {
-  document.documentElement.setAttribute('data-theme', t === 'dark' ? 'dark' : 'light');
+function askGrow() {
+  const t = $('askInp');
+  t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 128) + 'px';
+  $('askSend').disabled = state.askBusy || !t.value.trim();
 }
+
+// Light is set explicitly: this design was specified as the white one, so the
+// OS's dark preference must not silently override it.
+function applyTheme(t) { document.documentElement.setAttribute('data-theme', t === 'dark' ? 'dark' : 'light'); }
 
 /* ---------- boot ---------- */
 
 async function boot() {
-  await loadSessions();
-  loadApprovals();
+  await loadModel();
+  await loadProjects();
+  loadApprovalCount();
   const saved = localStorage.getItem('amelia-lite-sid');
-  const known = state.sessions.some((s) => (s.session_id || s.id) === saved);
-  if (saved && known) await selectSession(saved);
-  else if (state.sessions.length) await selectSession(state.sessions[0].session_id || state.sessions[0].id);
+  if (saved && state.cards.some((c) => c.session_id === saved)) await selectSession(saved);
+  else if (state.cards.length) await selectSession([...state.cards].sort((a, b) => updatedAt(b) - updatedAt(a))[0].session_id);
+  setProjView(localStorage.getItem('amelia-lite-projview') === 'board');
 }
 
 (async function init() {
@@ -368,23 +672,23 @@ async function boot() {
   $('send').onclick = send;
   $('inp').addEventListener('input', autoGrow);
   $('inp').addEventListener('keydown', (e) => {
-    // Enter sends on a real keyboard; on touch it stays a newline, so the
-    // button remains the primary path there.
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && window.matchMedia('(pointer:fine)').matches) {
-      e.preventDefault(); send();
-    }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && window.matchMedia('(pointer:fine)').matches) { e.preventDefault(); send(); }
   });
+  $('attach').onclick = () => $('fileInput').click();
+  $('fileInput').addEventListener('change', pickFiles);
 
-  $('profBtn').onclick = () => showView('profile');
-  $('inboxBtn').onclick = () => showView('inbox');
-  $('searchBtn').onclick = () => showView('sessions');
+  $('askSend').onclick = askSend;
+  $('askInp').addEventListener('input', askGrow);
+
+  $('newBtn').onclick = newSession;
+  $('connBtn').onclick = () => showView('conn');
   $('promoX').onclick = () => showPromo(null);
+  $('segList').onclick = () => setProjView(false);
+  $('segBoard').onclick = () => setProjView(true);
 
   $('themeRow').onclick = () => {
     const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-    localStorage.setItem('amelia-lite-theme', next);
-    applyTheme(next);
-    renderProfile();
+    localStorage.setItem('amelia-lite-theme', next); applyTheme(next); renderProfile();
   };
   $('signOutRow').onclick = async () => {
     try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {}
