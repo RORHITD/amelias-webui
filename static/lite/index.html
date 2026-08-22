@@ -1,201 +1,218 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="color-scheme" content="light dark" />
+<meta name="color-scheme" content="light" />
 <title>Amelia</title>
 <!--
-  Amelia Lite — a deliberately small client for the Hermes backend.
+  Amelia Lite — a small client for the Hermes backend, built to match the
+  Zellaro Tile app rather than to approximate it.
 
-  Why this exists as a SEPARATE client rather than as edits to panels.js:
-  this repo is a fork of nesquena/hermes-webui, and panels.js is ~13.6k lines of
-  upstream code. Editing it toward a new design would create merge conflicts on
-  every upstream pull, forever. These are new files under static/, which the
-  server already serves via its generic /static/ passthrough — so this ships
-  with ZERO changes to any upstream file, and the old UI keeps working untouched.
+  Every value below is lifted from the real source, not eyeballed:
+  colours from zellaro-tile-app/lib/core/constants/app_theme.dart, the bar
+  geometry from lib/widgets/glass_nav_bar.dart (white @ 62%, hairline white
+  @ 75%, blur sigma 24, pill radius, 46pt tall, 38 when compact), and the
+  Vogun display face copied from the app's own assets/fonts.
 
-  Scope is intentionally narrow: sign in, pick a session, talk to the agent.
-  The point is the twenty things done constantly, not parity with a panel system.
+  Still additive: these are new files under static/, which the server already
+  serves via its generic /static/ passthrough. No upstream file is touched, so
+  pulling from nesquena/hermes-webui stays conflict-free.
 -->
 <style>
-  :root{
-    --bg:#F6F7F9; --surface:#FFFFFF; --surface2:#ECEFF3;
-    --ink:#131A21; --inkSoft:#48596A; --muted:#71828F;
-    --line:#E2E7EC; --accent:#0F7B8A; --accentInk:#FFFFFF;
-    --bubble-me:#0F7B8A; --bubble-me-ink:#FFFFFF;
-    --glass:rgba(255,255,255,.72); --stroke:rgba(255,255,255,.9);
-    --risk:#A03A3A;
+  @font-face{
+    font-family:'Vogun'; src:url('Vogun-Medium.ttf') format('truetype');
+    font-weight:500; font-display:swap;
   }
-  @media (prefers-color-scheme:dark){
-    :root:not([data-theme="light"]){
-      --bg:#0D1216; --surface:#151D24; --surface2:#1B252E;
-      --ink:#E9EEF3; --inkSoft:#A7B6C4; --muted:#788896;
-      --line:#232F3A; --accent:#4FC3D4; --accentInk:#08131A;
-      --bubble-me:#2C7C89; --bubble-me-ink:#F2FAFC;
-      --glass:rgba(16,23,29,.66); --stroke:rgba(255,255,255,.10);
-      --risk:#E08585;
-    }
+
+  /* Zellaro's light palette, verbatim. Warm white — not #fff — is what stops
+     the whole thing reading as a clinical web page. */
+  :root{
+    --bg:#FBFAF8; --surface:#FFFFFF; --surfaceAlt:#F3F1ED; --divider:#E7E3DC;
+    --ink:#151517; --ink2:#6B7280; --ink3:#9CA3AF;
+    --brand:#151517; --onBrand:#FFFFFF;
+    --accent:#0D8AFF; --promo:#B85D43; --error:#B3261E; --success:#2E7D32;
+    --glass:rgba(255,255,255,.62); --glassStroke:rgba(255,255,255,.75);
+    --barShadow:0 6px 24px rgba(0,0,0,.12);
   }
   :root[data-theme="dark"]{
-    --bg:#0D1216; --surface:#151D24; --surface2:#1B252E;
-    --ink:#E9EEF3; --inkSoft:#A7B6C4; --muted:#788896;
-    --line:#232F3A; --accent:#4FC3D4; --accentInk:#08131A;
-    --bubble-me:#2C7C89; --bubble-me-ink:#F2FAFC;
-    --glass:rgba(16,23,29,.66); --stroke:rgba(255,255,255,.10);
-    --risk:#E08585;
+    --bg:#121211; --surface:#1C1B1A; --surfaceAlt:#2A2826; --divider:#2E2C29;
+    --ink:#F5F3EF; --ink2:#A8A29A; --ink3:#7C7770;
+    --brand:#FFFFFF; --onBrand:#121211;
+    --glass:rgba(0,0,0,.42); --glassStroke:rgba(255,255,255,.14);
+    --barShadow:0 6px 24px rgba(0,0,0,.40);
   }
 
-  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{height:100%}
   body{
-    margin:0; background:var(--bg); color:var(--ink);
-    font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
-    font-size:16px; line-height:1.55; -webkit-font-smoothing:antialiased;
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+    font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased;
     overscroll-behavior-y:none;
   }
-  button{font:inherit; color:inherit; border:none; background:none; cursor:pointer}
-  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  button{font:inherit;color:inherit;border:none;background:none;cursor:pointer;padding:0}
+  .display{font-family:'Vogun',Georgia,serif;font-weight:500;letter-spacing:-.005em}
 
-  /* ---- Collapsing header. Scroll down and it gets out of the way. ---- */
+  /* ---- Header: wordmark left, line icons right. Matches Zellaro exactly. ---- */
   #hdr{
-    position:fixed; inset:0 0 auto 0; z-index:40;
-    padding:calc(env(safe-area-inset-top) + 14px) 18px 12px;
-    background:var(--glass); backdrop-filter:blur(18px) saturate(1.6);
-    -webkit-backdrop-filter:blur(18px) saturate(1.6);
-    border-bottom:1px solid var(--line);
-    display:flex; align-items:center; gap:12px;
-    transition:transform .28s cubic-bezier(.4,0,.2,1), opacity .2s;
+    position:fixed;inset:0 0 auto 0;z-index:40;background:var(--bg);
+    padding:calc(env(safe-area-inset-top) + 10px) 18px 12px;
+    display:flex;align-items:center;gap:18px;
+    transition:transform .28s cubic-bezier(.4,0,.2,1);
   }
-  #hdr.away{transform:translateY(-102%); opacity:0}
-  #hdr h1{font-size:19px; font-weight:700; letter-spacing:-.02em; margin:0; flex:1}
-  #hdr .sub{font-size:12px; color:var(--muted); font-weight:500; letter-spacing:0}
-  .iconbtn{
-    width:36px; height:36px; border-radius:50%; display:grid; place-items:center;
-    background:var(--surface); border:1px solid var(--line); color:var(--inkSoft);
+  #hdr.away{transform:translateY(-102%)}
+  #hdr .wordmark{font-size:27px;line-height:1.1;flex:1;margin:0}
+  #hdr .acts{display:flex;align-items:center;gap:19px}
+  .hicon{color:var(--ink);display:grid;place-items:center;position:relative}
+  .hicon:active{opacity:.5}
+  .badge{
+    position:absolute;top:-6px;right:-8px;min-width:18px;height:18px;padding:0 5px;
+    background:var(--error);color:#fff;border-radius:999px;
+    font-size:11px;font-weight:700;display:grid;place-items:center;line-height:1;
   }
-  .iconbtn:active{opacity:.6}
 
-  /* ---- Scrollers ---- */
-  .view{display:none; height:100%; flex-direction:column}
+  /* Promo strip — Zellaro's terracotta bar, reused to surface agent state. */
+  #promo{
+    position:fixed;left:0;right:0;z-index:39;background:var(--promo);color:#fff;
+    top:calc(env(safe-area-inset-top) + 58px);
+    display:none;align-items:center;gap:10px;padding:11px 18px;font-size:14.5px;
+    transition:transform .28s cubic-bezier(.4,0,.2,1);
+  }
+  #promo.on{display:flex}
+  #hdr.away ~ #promo{transform:translateY(calc(-100% - 58px - env(safe-area-inset-top)))}
+  #promo .txt{flex:1}
+  #promo button{color:#fff;opacity:.9}
+
+  .view{display:none;height:100%;flex-direction:column}
   .view.on{display:flex}
   .scroll{
-    flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
-    padding:calc(env(safe-area-inset-top) + 74px) 16px 8px;
+    flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;
+    padding:calc(env(safe-area-inset-top) + 74px) 18px 8px;
   }
+  .scroll.promoOn{padding-top:calc(env(safe-area-inset-top) + 118px)}
+  h2.sec{font-size:26px;margin:22px 0 4px}
+  p.secsub{color:var(--ink2);font-size:15.5px;margin:0 0 18px}
 
   /* ---- Chat ---- */
-  .msg{margin:0 0 14px; display:flex}
+  .msg{margin:0 0 12px;display:flex}
   .msg.me{justify-content:flex-end}
   .bub{
-    max-width:min(78%,64ch); padding:11px 14px; border-radius:18px;
-    font-size:15.5px; white-space:pre-wrap; word-wrap:break-word;
-    background:var(--surface); border:1px solid var(--line);
+    max-width:min(80%,62ch);padding:11px 15px;border-radius:18px;font-size:15.5px;
+    white-space:pre-wrap;word-wrap:break-word;
+    background:var(--surface);border:1px solid var(--divider);
   }
-  .msg.me .bub{background:var(--bubble-me); color:var(--bubble-me-ink); border-color:transparent; border-bottom-right-radius:6px}
+  .msg.me .bub{background:var(--brand);color:var(--onBrand);border-color:transparent;border-bottom-right-radius:6px}
   .msg.bot .bub{border-bottom-left-radius:6px}
   .msg.tool .bub{
-    background:var(--surface2); border-style:dashed; color:var(--inkSoft);
-    font-family:ui-monospace,Menlo,monospace; font-size:12.5px; max-width:min(88%,72ch);
+    background:var(--surfaceAlt);border-color:transparent;color:var(--ink2);
+    font-size:12.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:600;
+    padding:7px 13px;border-radius:999px;
   }
-  .msg.err .bub{border-color:var(--risk); color:var(--risk)}
-  .empty{color:var(--muted); text-align:center; padding:64px 20px; font-size:14.5px}
-  .cursor::after{
-    content:"▍"; color:var(--accent); animation:blink 1s steps(2) infinite;
-  }
+  .msg.err .bub{border-color:var(--error);color:var(--error)}
+  .empty{color:var(--ink3);text-align:center;padding:70px 20px;font-size:15px}
+  .cursor::after{content:"▍";color:var(--ink3);animation:blink 1s steps(2) infinite}
   @keyframes blink{50%{opacity:0}}
 
-  /* ---- Composer, pinned above the floating bar ---- */
   #composer{
-    position:sticky; bottom:0; padding:8px 16px calc(env(safe-area-inset-bottom) + 104px);
-    background:linear-gradient(to top,var(--bg) 62%,transparent);
+    position:sticky;bottom:0;padding:8px 18px calc(env(safe-area-inset-bottom) + 100px);
+    background:linear-gradient(to top,var(--bg) 64%,transparent);
   }
   .cwrap{
-    display:flex; align-items:flex-end; gap:8px; padding:6px 6px 6px 14px;
-    background:var(--surface); border:1px solid var(--line); border-radius:24px;
-    box-shadow:0 6px 22px rgba(0,0,0,.07);
+    display:flex;align-items:flex-end;gap:8px;padding:6px 6px 6px 16px;
+    background:var(--surface);border:1px solid var(--divider);border-radius:999px;
   }
   #inp{
-    flex:1; border:none; outline:none; background:transparent; color:var(--ink);
-    font-size:16px; line-height:1.4; resize:none; max-height:132px; padding:8px 0;
-    font-family:inherit;
+    flex:1;border:none;outline:none;background:transparent;color:var(--ink);
+    font-size:16px;line-height:1.4;resize:none;max-height:128px;padding:9px 0;font-family:inherit;
   }
   #send{
-    width:38px; height:38px; border-radius:50%; background:var(--accent);
-    color:var(--accentInk); display:grid; place-items:center; flex:none;
-    transition:transform .12s, opacity .2s;
+    width:38px;height:38px;border-radius:999px;background:var(--brand);color:var(--onBrand);
+    display:grid;place-items:center;flex:none;transition:transform .12s,opacity .2s;
   }
-  #send:disabled{opacity:.35}
+  #send:disabled{opacity:.28}
   #send:active:not(:disabled){transform:scale(.9)}
 
-  /* ---- Sessions ---- */
+  /* ---- Rows / cards (Zellaro card radius 18) ---- */
   .row{
-    display:flex; align-items:center; gap:12px; padding:14px 15px; margin-bottom:9px;
-    background:var(--surface); border:1px solid var(--line); border-radius:13px;
+    display:flex;align-items:center;gap:13px;padding:15px 16px;margin-bottom:10px;
+    background:var(--surface);border:1px solid var(--divider);border-radius:18px;width:100%;text-align:left;
   }
-  .row:active{opacity:.65}
-  .row .t{flex:1; min-width:0}
-  .row .t b{display:block; font-size:15px; font-weight:620; letter-spacing:-.01em;
-    white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-  .row .t span{font-size:12.5px; color:var(--muted)}
-  .row.sel{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset}
-  .dot{width:8px; height:8px; border-radius:50%; background:var(--accent); flex:none}
+  .row:active{opacity:.6}
+  .row .t{flex:1;min-width:0}
+  .row .t b{display:block;font-size:15.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .t span{font-size:13px;color:var(--ink2)}
+  .row .chev{color:var(--ink3);flex:none}
+  .row.sel{border-color:var(--ink);box-shadow:0 0 0 1px var(--ink) inset}
+  .grouplbl{font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink3);font-weight:700;margin:26px 0 10px}
 
-  /* ---- Floating glass tab bar (Zellaro idiom): only the active tab is labelled,
-         which is what lets a pill fit real labels without shrinking the type. ---- */
+  /* ---- Profile, mirroring Zellaro's account screen ---- */
+  .avatar{
+    width:88px;height:88px;border-radius:999px;background:var(--surfaceAlt);
+    display:grid;place-items:center;font-size:30px;font-weight:600;color:var(--ink);
+    margin:8px auto 14px;font-family:'Vogun',Georgia,serif;
+  }
+  .pname{text-align:center;font-size:22px;margin:0 0 4px}
+  .pmail{text-align:center;color:var(--ink2);font-size:14px;margin:0 0 12px}
+  .pill{
+    display:flex;align-items:center;gap:7px;width:max-content;margin:0 auto 18px;
+    padding:7px 14px;border-radius:999px;background:var(--surfaceAlt);
+    font-size:13px;font-weight:600;color:var(--ink);
+  }
+  .ghostbtn{
+    display:block;width:100%;padding:14px;border-radius:14px;
+    border:1px solid var(--divider);background:var(--surface);
+    font-weight:600;font-size:15px;text-align:center;
+  }
+  .ghostbtn:active{opacity:.6}
+  .fine{color:var(--ink3);font-size:12.5px;text-align:center;margin:22px 0 4px}
+
+  /* ---- Floating glass bar. Geometry from glass_nav_bar.dart. ---- */
   #tabs{
-    position:fixed; left:0; right:0; bottom:0; z-index:50;
+    position:fixed;left:0;right:0;bottom:0;z-index:50;
     padding:0 16px calc(env(safe-area-inset-bottom) + 12px);
-    display:flex; justify-content:center; pointer-events:none;
+    display:flex;justify-content:center;pointer-events:none;
   }
   .bar{
-    pointer-events:auto; display:flex; gap:4px; padding:6px;
-    background:var(--glass); backdrop-filter:blur(20px) saturate(1.7);
-    -webkit-backdrop-filter:blur(20px) saturate(1.7);
-    border:1px solid var(--stroke); border-radius:999px;
-    box-shadow:0 8px 28px rgba(0,0,0,.16);
+    pointer-events:auto;display:flex;align-items:center;gap:2px;
+    padding:6px;width:100%;justify-content:space-between;
+    background:var(--glass);
+    backdrop-filter:blur(24px) saturate(1.8);-webkit-backdrop-filter:blur(24px) saturate(1.8);
+    border:1px solid var(--glassStroke);border-radius:999px;box-shadow:var(--barShadow);
+    transition:padding .2s;
   }
   .tab{
-    display:flex; align-items:center; gap:7px; height:44px; padding:0 15px;
-    border-radius:999px; color:var(--inkSoft); font-size:14px; font-weight:600;
-    transition:background .2s, color .2s, padding .2s;
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    height:46px;padding:0 14px;border-radius:999px;color:var(--ink);
+    font-size:15px;font-weight:600;position:relative;transition:height .2s,background .2s,color .2s;
   }
-  .tab .lbl{max-width:0; overflow:hidden; opacity:0; transition:max-width .24s, opacity .18s; white-space:nowrap}
-  .tab.on{background:var(--accent); color:var(--accentInk)}
-  .tab.on .lbl{max-width:110px; opacity:1}
+  .tab .lbl{max-width:0;overflow:hidden;opacity:0;white-space:nowrap;transition:max-width .24s,opacity .18s}
+  .tab.on{background:var(--brand);color:var(--onBrand)}
+  .tab.on .lbl{max-width:120px;opacity:1}
+  .bar.compact .tab{height:38px}
+  .bar.compact .tab .lbl{max-width:0;opacity:0}
   .tab svg{flex:none}
 
-  /* ---- Login ---- */
   #login{
-    position:fixed; inset:0; z-index:80; background:var(--bg);
-    display:none; flex-direction:column; align-items:center; justify-content:center;
-    padding:28px; gap:14px;
+    position:fixed;inset:0;z-index:80;background:var(--bg);display:none;
+    flex-direction:column;align-items:center;justify-content:center;padding:30px;gap:13px;
   }
   #login.on{display:flex}
-  #login h2{font-size:26px; letter-spacing:-.025em; margin:0 0 2px}
-  #login p{color:var(--muted); font-size:14px; margin:0 0 12px; text-align:center}
+  #login h2{font-size:34px;margin:0}
+  #login p{color:var(--ink2);font-size:15px;margin:0 0 14px;text-align:center}
   #pw{
-    width:min(340px,100%); padding:13px 15px; font-size:16px; border-radius:12px;
-    background:var(--surface); border:1px solid var(--line); color:var(--ink); outline:none;
+    width:min(340px,100%);padding:14px 16px;font-size:16px;border-radius:14px;
+    background:var(--surface);border:1px solid var(--divider);color:var(--ink);outline:none;
   }
-  #pw:focus{border-color:var(--accent)}
-  #go{
-    width:min(340px,100%); padding:13px; border-radius:12px; font-weight:660;
-    background:var(--accent); color:var(--accentInk);
-  }
-  #lerr{color:var(--risk); font-size:13.5px; min-height:19px}
-  .brand{
-    width:56px; height:56px; border-radius:17px; background:var(--accent);
-    color:var(--accentInk); display:grid; place-items:center;
-    font-weight:800; font-size:23px; letter-spacing:-.03em; margin-bottom:6px;
-  }
+  #pw:focus{border-color:var(--ink)}
+  #go{width:min(340px,100%);padding:14px;border-radius:14px;font-weight:600;background:var(--brand);color:var(--onBrand)}
+  #lerr{color:var(--error);font-size:13.5px;min-height:19px}
 </style>
 </head>
 <body>
 
 <div id="login">
-  <div class="brand">A</div>
-  <h2>Amelia</h2>
+  <h2 class="display">Amelia</h2>
   <p>Sign in to your agent</p>
   <input id="pw" type="password" placeholder="Password" autocomplete="current-password" aria-label="Password" />
   <button id="go">Sign in</button>
@@ -203,21 +220,22 @@
 </div>
 
 <header id="hdr">
-  <div style="flex:1;min-width:0">
-    <h1 id="title">Amelia</h1>
-    <div class="sub" id="sub">connecting…</div>
+  <h1 class="wordmark display" id="wordmark">Amelia</h1>
+  <div class="acts">
+    <button class="hicon" id="searchBtn" aria-label="Search">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    </button>
+    <button class="hicon" id="profBtn" aria-label="Profile">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="8.5" r="3.6"/><path d="M5 19.5a7 7 0 0 1 14 0"/></svg>
+    </button>
+    <button class="hicon" id="inboxBtn" aria-label="Approvals">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h13l3 3v11H4z"/><path d="M4 13h5l1.5 2.5h3L15 13h5"/></svg>
+      <span class="badge" id="hdrBadge" style="display:none">0</span>
+    </button>
   </div>
-  <button class="iconbtn" id="themeBtn" aria-label="Toggle theme" title="Theme">
-    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
-      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>
-    </svg>
-  </button>
-  <button class="iconbtn" id="newBtn" aria-label="New session" title="New session">
-    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
-      <path d="M12 5v14M5 12h14"/>
-    </svg>
-  </button>
 </header>
+
+<div id="promo"><span class="txt" id="promoTxt"></span><button id="promoX" aria-label="Dismiss">✕</button></div>
 
 <main style="height:100%">
   <section class="view on" id="v-chat">
@@ -233,19 +251,65 @@
   </section>
 
   <section class="view" id="v-sessions">
-    <div class="scroll" style="padding-bottom:120px" id="sessScroll"><div id="sessList"></div></div>
+    <div class="scroll" style="padding-bottom:120px">
+      <p class="secsub" style="margin-top:6px">Everything you have going</p>
+      <div id="sessList"></div>
+    </div>
+  </section>
+
+  <section class="view" id="v-skills">
+    <div class="scroll" style="padding-bottom:120px">
+      <p class="secsub" style="margin-top:6px">What Amelia can do for you</p>
+      <div id="skillList"></div>
+    </div>
+  </section>
+
+  <section class="view" id="v-profile">
+    <div class="scroll" style="padding-bottom:120px">
+      <div class="avatar" id="pAvatar" style="margin-top:14px">A</div>
+      <p class="pname display" id="pName">Richy Orozco</p>
+      <p class="pmail" id="pMail">this device</p>
+      <div class="pill"><span id="pDot" style="width:7px;height:7px;border-radius:999px;background:var(--success);display:inline-block"></span><span id="pState">Connected</span></div>
+      <div class="grouplbl">Agent</div>
+      <div id="pAgent"></div>
+      <div class="grouplbl">App</div>
+      <button class="row" id="themeRow"><span class="t"><b>Appearance</b><span id="themeVal">Light</span></span><span class="chev">›</span></button>
+      <button class="row" id="signOutRow"><span class="t"><b>Sign out</b><span>End this session on the device</span></span><span class="chev">›</span></button>
+      <p class="fine" id="verLine">Amelia Lite</p>
+      <p class="fine" style="letter-spacing:.12em;text-transform:uppercase;font-size:11px">Built by Houston IT Developers</p>
+    </div>
+  </section>
+
+  <section class="view" id="v-inbox">
+    <div class="scroll" style="padding-bottom:120px">
+      <p class="secsub" style="margin-top:6px">Anything waiting on you</p>
+      <div id="inboxList"></div>
+    </div>
   </section>
 </main>
 
 <nav id="tabs">
-  <div class="bar" role="tablist">
+  <div class="bar" id="bar" role="tablist">
     <button class="tab on" data-v="chat" role="tab" aria-selected="true">
-      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.9 9.9 0 0 1-4.2-.9L3 20.5l1.6-4.4A8.3 8.3 0 0 1 3.6 11.5a8.4 8.4 0 0 1 9-8.4 8.4 8.4 0 0 1 8.4 8.4Z"/></svg>
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 11.8a8 8 0 0 1-8.6 8 9.5 9.5 0 0 1-4-.9L3.5 20.3l1.5-4.2a8 8 0 0 1-1-4.3 8 8 0 0 1 8.6-8 8 8 0 0 1 8 8Z"/></svg>
       <span class="lbl">Chat</span>
     </button>
     <button class="tab" data-v="sessions" role="tab" aria-selected="false">
-      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/></svg>
       <span class="lbl">Sessions</span>
+    </button>
+    <button class="tab" data-v="skills" role="tab" aria-selected="false">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3.2 13.7 8l4.8 1.7-4.8 1.7L12 16.2l-1.7-4.8L5.5 9.7 10.3 8Z"/><path d="M18.5 15.2l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8Z"/></svg>
+      <span class="lbl">Skills</span>
+    </button>
+    <button class="tab" data-v="profile" role="tab" aria-selected="false">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="8.5" r="3.6"/><path d="M5 19.5a7 7 0 0 1 14 0"/></svg>
+      <span class="lbl">Profile</span>
+    </button>
+    <button class="tab" data-v="inbox" role="tab" aria-selected="false">
+      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h13l3 3v11H4z"/><path d="M4 13h5l1.5 2.5h3L15 13h5"/></svg>
+      <span class="lbl">Approvals</span>
+      <span class="badge" id="tabBadge" style="display:none">0</span>
     </button>
   </div>
 </nav>

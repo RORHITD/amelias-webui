@@ -98,7 +98,6 @@ async function selectSession(id) {
   state.sid = id;
   localStorage.setItem('amelia-lite-sid', id);
   $('msgs').innerHTML = '';
-  $('sub').textContent = 'session ready';
   renderSessions();
 }
 
@@ -204,10 +203,101 @@ async function send() {
 function setStreaming(on) {
   state.streaming = on;
   $('send').disabled = on || !$('inp').value.trim();
-  $('sub').textContent = on ? 'thinking…' : 'ready';
+  // Zellaro's terracotta strip is the app's one "something is happening" slot,
+  // so agent activity reuses it rather than inventing a second status area.
+  showPromo(on ? 'Amelia is working…' : null);
+}
+
+function showPromo(text) {
+  const el = $('promo');
+  if (!text) { el.classList.remove('on'); document.querySelectorAll('.scroll').forEach(s=>s.classList.remove('promoOn')); return; }
+  $('promoTxt').textContent = text;
+  el.classList.add('on');
+  document.querySelectorAll('.scroll').forEach(s=>s.classList.add('promoOn'));
+}
+
+/* ---------- skills / approvals / profile ---------- */
+
+async function renderSkills() {
+  const el = $('skillList');
+  if (el.dataset.loaded) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  let items = [];
+  try {
+    const d = await api('/api/skills');
+    items = Array.isArray(d) ? d : (d.skills || d.items || []);
+  } catch (_) { items = []; }
+  if (!items.length) { el.innerHTML = '<div class="empty">No skills installed.</div>'; return; }
+  el.innerHTML = '';
+  for (const s of items.slice(0, 60)) {
+    const r = document.createElement('div');
+    r.className = 'row';
+    r.innerHTML = '<span class="t"><b></b><span></span></span>';
+    r.querySelector('b').textContent = s.name || s.id || 'skill';
+    r.querySelector('.t span').textContent = (s.description || '').slice(0, 90);
+    el.appendChild(r);
+  }
+  el.dataset.loaded = '1';
+}
+
+async function loadApprovals() {
+  const el = $('inboxList');
+  let items = [];
+  try {
+    const d = await api('/api/approval/pending');
+    items = Array.isArray(d) ? d : (d.pending || d.approvals || d.items || []);
+  } catch (_) { items = []; }
+  setBadge(items.length);
+  if (!items.length) { el.innerHTML = '<div class="empty">Nothing waiting on you.</div>'; return; }
+  el.innerHTML = '';
+  for (const a of items) {
+    const r = document.createElement('div');
+    r.className = 'row';
+    r.innerHTML = '<span class="t"><b></b><span></span></span>';
+    r.querySelector('b').textContent = a.title || a.tool || 'Approval needed';
+    r.querySelector('.t span').textContent = (a.command || a.detail || '').slice(0, 100);
+    el.appendChild(r);
+  }
+}
+
+function setBadge(n) {
+  for (const id of ['hdrBadge', 'tabBadge']) {
+    const b = $(id);
+    b.textContent = n;
+    b.style.display = n > 0 ? 'grid' : 'none';
+  }
+}
+
+function renderProfile() {
+  const host = location.hostname || 'this device';
+  $('pMail').textContent = host;
+  $('pState').textContent = state.streaming ? 'Working' : 'Connected';
+  $('pDot').style.background = 'var(--success)';
+  $('themeVal').textContent =
+    document.documentElement.getAttribute('data-theme') === 'dark' ? 'Dark' : 'Light';
+
+  const el = $('pAgent');
+  el.innerHTML = '';
+  const rows = [
+    ['Sessions', state.sessions.length + ' open'],
+    ['Active session', state.sid ? state.sid.slice(0, 18) + '…' : 'none selected'],
+    ['New session', 'Start a fresh workspace'],
+  ];
+  rows.forEach(([t, sub], i) => {
+    const r = document.createElement('button');
+    r.className = 'row';
+    r.innerHTML = '<span class="t"><b></b><span></span></span><span class="chev">\u203a</span>';
+    r.querySelector('b').textContent = t;
+    r.querySelector('.t span').textContent = sub;
+    if (i === 0) r.onclick = () => showView('sessions');
+    if (i === 2) r.onclick = () => newSession();
+    el.appendChild(r);
+  });
 }
 
 /* ---------- chrome ---------- */
+
+const TITLES = { chat:'Amelia', sessions:'Sessions', skills:'Skills', profile:'Profile', inbox:'Approvals' };
 
 function showView(v) {
   document.querySelectorAll('.view').forEach((s) => s.classList.toggle('on', s.id === 'v-' + v));
@@ -216,8 +306,13 @@ function showView(v) {
     t.classList.toggle('on', on);
     t.setAttribute('aria-selected', on ? 'true' : 'false');
   });
-  $('title').textContent = v === 'chat' ? 'Amelia' : 'Sessions';
+  // The wordmark carries the section name, the way Zellaro's does.
+  $('wordmark').textContent = TITLES[v] || 'Amelia';
+  $('hdr').classList.remove('away');
   if (v === 'sessions') loadSessions();
+  if (v === 'skills') renderSkills();
+  if (v === 'profile') renderProfile();
+  if (v === 'inbox') loadApprovals();
 }
 
 // Scrolling down means reading — give the pixels back. Scrolling up means
@@ -232,6 +327,9 @@ function wireChrome() {
       if (y < TOP) { $('hdr').classList.remove('away'); last = y; return; }
       if (Math.abs(d) < THRESH) return;
       $('hdr').classList.toggle('away', d > 0);
+      // The bar tightens to icons-only rather than vanishing, so the primary
+      // control never leaves the screen while reading.
+      $('bar').classList.toggle('compact', d > 0);
       last = y;
     }, { passive: true });
   });
@@ -244,16 +342,17 @@ function autoGrow() {
   $('send').disabled = state.streaming || !t.value.trim();
 }
 
+// Light is the default and is set explicitly — the page must not inherit the
+// OS's dark preference, because this design is specified as the white one.
 function applyTheme(t) {
-  if (t) document.documentElement.setAttribute('data-theme', t);
-  else document.documentElement.removeAttribute('data-theme');
+  document.documentElement.setAttribute('data-theme', t === 'dark' ? 'dark' : 'light');
 }
 
 /* ---------- boot ---------- */
 
 async function boot() {
-  $('sub').textContent = 'ready';
   await loadSessions();
+  loadApprovals();
   const saved = localStorage.getItem('amelia-lite-sid');
   const known = state.sessions.some((s) => (s.session_id || s.id) === saved);
   if (saved && known) await selectSession(saved);
@@ -261,29 +360,37 @@ async function boot() {
 }
 
 (async function init() {
-  applyTheme(localStorage.getItem('amelia-lite-theme'));
+  applyTheme(localStorage.getItem('amelia-lite-theme') || 'light');
   wireChrome();
 
   $('go').onclick = signIn;
   $('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') signIn(); });
   $('send').onclick = send;
-  $('newBtn').onclick = newSession;
   $('inp').addEventListener('input', autoGrow);
   $('inp').addEventListener('keydown', (e) => {
-    // Enter sends; Shift+Enter breaks the line. On touch keyboards Enter is a
-    // newline, so the button stays the primary path there.
+    // Enter sends on a real keyboard; on touch it stays a newline, so the
+    // button remains the primary path there.
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && window.matchMedia('(pointer:fine)').matches) {
       e.preventDefault(); send();
     }
   });
-  $('themeBtn').onclick = () => {
-    const cur = document.documentElement.getAttribute('data-theme');
-    const dark = window.matchMedia('(prefers-color-scheme:dark)').matches;
-    const next = cur ? (cur === 'dark' ? 'light' : null) : (dark ? 'light' : 'dark');
-    if (next) localStorage.setItem('amelia-lite-theme', next);
-    else localStorage.removeItem('amelia-lite-theme');
+
+  $('profBtn').onclick = () => showView('profile');
+  $('inboxBtn').onclick = () => showView('inbox');
+  $('searchBtn').onclick = () => showView('sessions');
+  $('promoX').onclick = () => showPromo(null);
+
+  $('themeRow').onclick = () => {
+    const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    localStorage.setItem('amelia-lite-theme', next);
     applyTheme(next);
+    renderProfile();
   };
+  $('signOutRow').onclick = async () => {
+    try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {}
+    location.reload();
+  };
+
   document.querySelectorAll('.tab').forEach((t) => { t.onclick = () => showView(t.dataset.v); });
 
   if (await checkAuth()) await boot();
