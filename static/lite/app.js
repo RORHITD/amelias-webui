@@ -521,21 +521,7 @@ async function renderProfile() {
   $('pState').textContent = state.streaming ? 'Working' : 'Connected';
   $('themeVal').textContent = document.documentElement.getAttribute('data-theme') === 'dark' ? 'Dark' : 'Light';
 
-  // AI models
-  const mEl = $('pModels'); mEl.innerHTML = '';
-  let models = [];
-  try { models = listOf(await api('/api/models'), 'models', 'items'); } catch (_) {}
-  if (!models.length) mEl.innerHTML = '<div class="empty" style="padding:22px">No models reported.</div>';
-  models.slice(0, 12).forEach((m) => {
-    const name = m.id || m.name || m.model || String(m);
-    const r = document.createElement('div');
-    r.className = 'row';
-    r.innerHTML = '<span class="t"><b></b><span></span></span><span class="dis">Disconnect</span>';
-    r.querySelector('b').textContent = name;
-    r.querySelector('.t span').textContent = (m.provider || m.owned_by || 'local') + (name === state.model ? ' · in use' : '');
-    r.querySelector('.dis').onclick = () => showPromo('Disconnecting models is not wired up yet.');
-    mEl.appendChild(r);
-  });
+  await renderModels();
 
   // Devices — the two machines the brain and vault already span.
   const dEl = $('pDevices'); dEl.innerHTML = '';
@@ -592,6 +578,116 @@ async function renderSkills() {
     r.querySelector('.t span').textContent = (uses ? uses + ' uses · ' : '') + String(s.description || '').slice(0, 70);
     el.appendChild(r);
   });
+}
+
+
+/* ---------- models ---------- */
+
+// Local endpoints already running on Richy's two machines. Prefilling these is
+// the difference between "connect a local model" being a five-minute lookup and
+// being one tap.
+const LOCAL_PRESETS = [
+  { label: 'Ollama on the GPU box', provider: 'ollama', base_url: 'http://100.86.83.64:11434/v1' },
+  { label: 'MLX on this Mac',       provider: 'openai-compatible', base_url: 'http://127.0.0.1:8791/v1' },
+];
+
+async function renderModels() {
+  const el = $('pModels');
+  el.innerHTML = '<div class="empty" style="padding:18px">Loading models…</div>';
+
+  let models = [];
+  try {
+    const d = await api('/api/models');
+    // The endpoint returns a dict whose model list has moved around upstream;
+    // take whichever array is actually there rather than betting on one key.
+    models = listOf(d, 'models', 'items', 'data', 'available');
+    if (!models.length && d && typeof d === 'object') {
+      for (const v of Object.values(d)) if (Array.isArray(v) && v.length) { models = v; break; }
+    }
+  } catch (_) {}
+
+  el.innerHTML = '';
+  if (!models.length) {
+    el.innerHTML = '<div class="empty" style="padding:18px">No models reported.</div>';
+  }
+
+  models.slice(0, 25).forEach((m) => {
+    const name = (typeof m === 'string') ? m : (m.id || m.name || m.model || '');
+    if (!name) return;
+    const provider = (typeof m === 'object' && (m.provider || m.owned_by)) || 'local';
+    const inUse = name === state.model;
+    const r = document.createElement('button');
+    r.className = 'row' + (inUse ? ' sel' : '');
+    r.innerHTML = '<span class="t"><b></b><span></span></span><span class="chev"></span>';
+    r.querySelector('b').textContent = name;
+    r.querySelector('.t span').textContent = provider + (inUse ? ' · in use' : '');
+    r.querySelector('.chev').textContent = inUse ? '✓' : '›';
+    r.onclick = () => useModel(name, typeof m === 'object' ? m.provider : null);
+    el.appendChild(r);
+  });
+
+  const add = document.createElement('button');
+  add.className = 'row';
+  add.innerHTML = '<span class="t"><b>Add a local model</b><span>Ollama, MLX, or anything OpenAI-compatible</span></span><span class="chev">›</span>';
+  add.onclick = showLocalForm;
+  el.appendChild(add);
+}
+
+async function useModel(name, provider) {
+  try {
+    await api('/api/model/set', {
+      method: 'POST',
+      body: JSON.stringify({ scope: 'main', model: name, provider: provider || 'auto' }),
+    });
+    state.model = name;
+    $('mdlName').textContent = name;
+    showPromo('Now using ' + name);
+    renderModels();
+  } catch (e) { showPromo('Could not switch model: ' + e.message); }
+}
+
+function showLocalForm() {
+  const el = $('pModels');
+  if ($('localForm')) { $('localForm').scrollIntoView({ block: 'center' }); return; }
+  const box = document.createElement('div');
+  box.id = 'localForm';
+  box.className = 'conn';
+  box.innerHTML =
+    '<div class="top"><b>Connect a local model</b></div>' +
+    '<p>Runs on your own hardware. Nothing leaves your machines.</p>' +
+    '<div class="filterbar" id="presetRow"></div>' +
+    '<input id="lfUrl" class="lfin" placeholder="http://host:port/v1" />' +
+    '<input id="lfModel" class="lfin" placeholder="model name (e.g. qwen3.8:27b)" />' +
+    '<div class="act"><button class="btn-s" id="lfSave">Connect</button>' +
+    '<button class="btn-g" id="lfCancel">Cancel</button></div>';
+  el.appendChild(box);
+
+  const pr = box.querySelector('#presetRow');
+  LOCAL_PRESETS.forEach((p) => {
+    const b = document.createElement('button');
+    b.className = 'chip'; b.textContent = p.label;
+    b.onclick = () => { $('lfUrl').value = p.base_url; box.dataset.provider = p.provider; };
+    pr.appendChild(b);
+  });
+
+  box.querySelector('#lfCancel').onclick = () => box.remove();
+  box.querySelector('#lfSave').onclick = async () => {
+    const base_url = $('lfUrl').value.trim(), model = $('lfModel').value.trim();
+    if (!base_url || !model) { showPromo('Need both a URL and a model name.'); return; }
+    try {
+      await api('/api/providers/self-hosted', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider: box.dataset.provider || 'openai-compatible',
+          base_url, model, activate: true,
+        }),
+      });
+      box.remove();
+      showPromo('Connected ' + model);
+      await loadModel(); await renderModels();
+    } catch (e) { showPromo('Could not connect: ' + e.message); }
+  };
+  box.scrollIntoView({ block: 'center' });
 }
 
 /* ---------- Ask AI ---------- */
