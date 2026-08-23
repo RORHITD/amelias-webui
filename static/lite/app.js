@@ -596,6 +596,12 @@ async function renderSkills() {
 const LOCAL_PRESETS = [
   { label: 'Ollama on the GPU box', provider: 'ollama', base_url: 'http://100.86.83.64:11434/v1' },
   { label: 'MLX on this Mac',       provider: 'openai-compatible', base_url: 'http://127.0.0.1:8791/v1' },
+  // Cloud providers Hermes has no built-in entry for. Both speak the OpenAI
+  // protocol, so they need a base URL and a key rather than an integration.
+  // Endpoints verified by probe: /v1/models returns 401 (exists, wants auth)
+  // rather than 404 or a DNS failure.
+  { label: 'Kimi (Moonshot)', provider: 'custom', base_url: 'https://api.moonshot.ai/v1', key: true },
+  { label: 'MiniMax',         provider: 'custom', base_url: 'https://api.minimax.io/v1',  key: true },
 ];
 
 async function renderModels() {
@@ -665,6 +671,7 @@ function showLocalForm() {
     '<div class="filterbar" id="presetRow"></div>' +
     '<input id="lfUrl" class="lfin" placeholder="http://host:port/v1" />' +
     '<input id="lfModel" class="lfin" placeholder="model name (e.g. qwen3.8:27b)" />' +
+    '<input id="lfKey" class="lfin" type="password" placeholder="API key (leave blank for local)" autocomplete="off" />' +
     '<div class="act"><button class="btn-s" id="lfSave">Connect</button>' +
     '<button class="btn-g" id="lfCancel">Cancel</button></div>';
   el.appendChild(box);
@@ -673,7 +680,13 @@ function showLocalForm() {
   LOCAL_PRESETS.forEach((p) => {
     const b = document.createElement('button');
     b.className = 'chip'; b.textContent = p.label;
-    b.onclick = () => { $('lfUrl').value = p.base_url; box.dataset.provider = p.provider; };
+    b.onclick = () => {
+      $('lfUrl').value = p.base_url;
+      box.dataset.provider = p.provider;
+      // Local endpoints need no key; cloud ones do. Say which, rather than
+      // leaving an empty box that fails opaquely on save.
+      $('lfKey').placeholder = p.key ? 'API key (required)' : 'API key (not needed for local)';
+    };
     pr.appendChild(b);
   });
 
@@ -687,6 +700,7 @@ function showLocalForm() {
         body: JSON.stringify({
           provider: box.dataset.provider || 'openai-compatible',
           base_url, model, activate: true,
+          api_key: ($('lfKey').value || '').trim() || undefined,
         }),
       });
       box.remove();
