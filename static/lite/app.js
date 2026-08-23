@@ -438,13 +438,35 @@ async function renderStack() {
     return box;
   }
 
-  const chips = (items) => items.map(([n, c]) => '<span class="chip">' + n + ' ×' + c + '</span>').join('');
+  // These names come from scanned package.json dependencies, i.e. from data
+  // this app did not author. Concatenating them into innerHTML would let a
+  // crafted manifest ("<img src=x onerror=...>" as a dependency name) execute.
+  // Build the nodes and set textContent instead.
+  const chipRow = (items) => {
+    const row = document.createElement('div');
+    row.className = 'filterbar';
+    items.forEach(([n, c]) => {
+      const el = document.createElement('span');
+      el.className = 'chip';
+      el.textContent = n + ' ×' + c;
+      row.appendChild(el);
+    });
+    return row;
+  };
+  const label = (t) => {
+    const d = document.createElement('div');
+    d.className = 'grouplbl';
+    d.style.margin = '14px 0 8px';
+    d.textContent = t;
+    return d;
+  };
+
   box.innerHTML =
-    '<div class="top"><b>Your stack</b><span class="state st-on">' + agg.projects + ' projects</span></div>' +
-    '<p style="margin-bottom:8px">Detected from manifests on this machine. No accounts connected yet.</p>' +
-    '<div class="grouplbl" style="margin:14px 0 8px">Frameworks</div><div class="filterbar">' + chips(agg.frameworks.slice(0, 6)) + '</div>' +
-    '<div class="grouplbl" style="margin:14px 0 8px">Deploys to</div><div class="filterbar">' + chips(agg.hosting.slice(0, 6)) + '</div>' +
-    '<div class="grouplbl" style="margin:14px 0 8px">Paid services in code</div><div class="filterbar">' + chips(agg.paid_services.slice(0, 8)) + '</div>';
+    '<div class="top"><b>Your stack</b><span class="state st-on">' + Number(agg.projects) + ' projects</span></div>' +
+    '<p style="margin-bottom:8px">Detected from manifests on this machine. No accounts connected yet.</p>';
+  box.appendChild(label('Frameworks'));      box.appendChild(chipRow(agg.frameworks.slice(0, 6)));
+  box.appendChild(label('Deploys to'));      box.appendChild(chipRow(agg.hosting.slice(0, 6)));
+  box.appendChild(label('Paid services in code')); box.appendChild(chipRow(agg.paid_services.slice(0, 8)));
 
   // The savings line is the point of all this — but it is an ESTIMATE from
   // dependency manifests, not from a bill. Say so, and never state a figure
