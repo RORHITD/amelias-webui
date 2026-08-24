@@ -10049,6 +10049,13 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "display_title",
     "_state_db_title",
     "workspace",
+    # Claude Code rows already carry the real per-session working directory
+    # (get_claude_code_sessions sets 'cwd' from the transcript's own metadata),
+    # but this allowlist dropped it, leaving every CLI session reporting the
+    # same global `workspace`. Clients then have no way to tell which project a
+    # session belonged to. `workspace` is the active workspace; `cwd` is where
+    # the session actually ran, and only the latter can group them.
+    "cwd",
     "model",
     "model_provider",
     "message_count",
