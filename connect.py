@@ -229,8 +229,22 @@ def serve_one(ws: WS, local: str, frame: dict) -> None:
         host, _, port = local.partition(":")
         conn = http.client.HTTPConnection(host, int(port or 80), timeout=180)
         body = base64.b64decode(frame["body"]) if frame.get("body") else None
+        headers = dict(frame.get("headers") or {})
+
+        # React Native cannot send a Cookie header — it is a forbidden header
+        # name, and the native cookie jar is not replayed for fetch. So the app
+        # carries its session in X-Hermes-Session instead, and it is turned back
+        # into a cookie here, at the last hop before the server sees it.
+        #
+        # Doing the translation in the connector rather than patching the server
+        # means this works against an unmodified upstream Hermes: nothing
+        # downstream has to know the app has that limitation.
+        token = headers.pop("x-hermes-session", None)
+        if token and "cookie" not in headers:
+            headers["Cookie"] = token if "=" in token else f"hermes_session={token}"
+
         conn.request(frame.get("method", "GET"), frame.get("path", "/"),
-                     body=body, headers=frame.get("headers") or {})
+                     body=body, headers=headers)
         res = conn.getresponse()
         data = res.read()
         out = {
