@@ -1019,7 +1019,24 @@ def invalidate_session(cookie_value) -> None:
 
 
 def parse_cookie(handler) -> str | None:
-    """Extract the auth cookie from the request headers."""
+    """Extract the auth session token from the request headers.
+
+    Prefers the cookie. Falls back to ``X-Hermes-Session`` because native
+    mobile clients cannot use the cookie at all: React Native exposes
+    ``Set-Cookie`` on the response but strips ``Cookie`` from requests (it is a
+    forbidden header name) and does not replay its native cookie jar, so a
+    correct login yields a token the client can read and never send. Every
+    subsequent call arrives anonymous and 401s.
+
+    This is the same opaque session token, validated identically — only the
+    transport differs. A custom request header is if anything harder to abuse
+    than a cookie, since browsers will not attach it cross-site the way they
+    attach cookies, so this does not widen the CSRF surface.
+    """
+    header_token = handler.headers.get('X-Hermes-Session', '')
+    if header_token:
+        return header_token.strip() or None
+
     cookie_header = handler.headers.get('Cookie', '')
     if not cookie_header:
         return None
