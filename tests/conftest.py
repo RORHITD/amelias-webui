@@ -621,6 +621,44 @@ def _strip_skip_onboarding_env():
     if prior is not None:
         os.environ["HERMES_WEBUI_SKIP_ONBOARDING"] = prior
 
+# ── Tests that assert UPSTREAM's identity, in a fork that replaced it ─────────
+#
+# This repo is a fork. Its README is 2.3KB of Amelia branding where upstream's
+# is tens of kilobytes of Hermes documentation, and its in-app "report an issue"
+# link points at THIS repo's tracker rather than nesquena/hermes-webui.
+#
+# Seven upstream tests assert the text that was deliberately replaced. They are
+# not detecting a regression — the fork is right and the assertion is stale. But
+# they turned the whole suite red, and a suite that is always red is a suite
+# nobody reads: these have been failing since 19 August on the repo people
+# actually install the agent from.
+#
+# Skipped BY NAME rather than by pattern, on purpose. A pattern like
+# "anything touching README" would silently swallow a genuinely new upstream doc
+# test as well, which is how a skip list stops being a record and starts being a
+# blindfold. Each entry here names one test and one reason; a new upstream doc
+# test still fails loudly until somebody looks at it.
+#
+# Delete an entry the moment the fork's docs grow the section it wants.
+_UPSTREAM_DOC_TESTS = {
+    'test_why_hermes_doc_remains_linked_from_readme':
+        "asserts the README links docs/why-hermes.md; this fork's README is its own",
+    'test_readme_common_failures_mentions_host_localhost':
+        "asserts an upstream README troubleshooting section this fork does not carry",
+    'test_docker_docs_warn_sudo_changes_home_bind_mount':
+        "asserts upstream Docker docs prose; this fork ships its own install path",
+    'test_help_pane_present':
+        "asserts the help pane links nesquena/hermes-webui/issues — a fork must "
+        "point at its OWN tracker, and it does",
+    'test_wsl_autostart_docs_cover_session_and_task_scheduler_options':
+        "asserts an upstream WSL autostart section this fork's README does not have",
+    'test_readme_wires_published_agent_flake_package':
+        "asserts an upstream Nix flake README section this fork does not carry",
+    'test_nixos_module_defaults_to_loopback_with_explicit_firewall_opt_in':
+        "same missing README section — upstream's parser IndexErrors on this fork",
+}
+
+
 def pytest_collection_modifyitems(config, items):
     """Auto-skip agent-dependent tests when hermes-agent is not available.
 
@@ -628,7 +666,16 @@ def pytest_collection_modifyitems(config, items):
     test names to known categories that depend on hermes-agent modules.
     This keeps the test files clean and ensures new cron/skills tests
     get auto-skipped without manual annotation.
+
+    Also skips the upstream documentation tests listed above, which assert
+    text this fork deliberately replaced. That runs FIRST and unconditionally,
+    because it has nothing to do with whether hermes-agent is installed.
     """
+    for item in items:
+        why = _UPSTREAM_DOC_TESTS.get(item.name)
+        if why:
+            item.add_marker(pytest.mark.skip(reason=f"fork: {why}"))
+
     if AGENT_MODULES_AVAILABLE:
         return  # everything available, run all tests
 
