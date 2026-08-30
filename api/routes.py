@@ -12741,6 +12741,41 @@ def handle_get(handler, parsed) -> bool:
         j(handler, build_system_health_payload())
         return True
 
+    if parsed.path == "/api/capabilities":
+        # What this machine can do, so the phone app can ask instead of
+        # guessing from the URL shape -- a machine paired with a code is
+        # reached through the same relay as a rented sandbox, and the URL
+        # cannot tell the two apart. Each flag names the route it is a claim
+        # about; if one of those routes changes, change the flag with it.
+        return j(handler, {
+            "backend": "hermes",
+            "capabilities": {
+                "providers": True,    # /api/providers/*
+                "reasoning": True,    # /api/reasoning
+                "approvals": True,    # /api/approval/respond
+                "projects": True,     # /api/projects
+                "kanban": True,       # /api/kanban/board
+                "uploads": True,      # POST /api/upload, JSON contract included
+            },
+        })
+
+    if parsed.path == "/api/devices":
+        from api.devices import attached_devices
+        return j(handler, attached_devices())
+
+    if parsed.path == "/api/device-check":
+        # Does the app come up on the phone that is actually plugged in.
+        # A GET with query parameters rather than a POST: it starts nothing
+        # that outlives the request and changes nothing on the device.
+        from api.devices import device_check
+        q = parse_qs(parsed.query or "")
+        device = (q.get("device") or [""])[0]
+        app_id = (q.get("app") or [""])[0]
+        platform = (q.get("platform") or ["android"])[0]
+        if not device or not app_id:
+            return j(handler, {"error": "which device, and which app id"}, status=400)
+        return j(handler, device_check(device, app_id, platform))
+
     if parsed.path == "/api/models":
         # Profile-scoping for non-default profiles (#3957) is handled INSIDE
         # get_available_models() — it binds the active profile's env + TLS on

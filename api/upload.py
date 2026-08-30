@@ -210,6 +210,14 @@ def handle_upload(handler):
         content_length = int(handler.headers.get('Content-Length', 0) or 0)
         if content_length > MAX_UPLOAD_BYTES:
             return j(handler, {'error': f'File too large (max {MAX_UPLOAD_BYTES//1024//1024}MB)'}, status=413)
+        # The phone app's contract: JSON {name, data(base64), mime, kind},
+        # answered with {path, kind, bytes, url?}. The browser sends multipart
+        # with a session_id; the app has no session yet when it attaches a
+        # file, so its uploads land in a flat directory of basenames instead
+        # of a session's attachment dir. Dispatch on Content-Type -- the two
+        # callers cannot be confused with each other.
+        if content_type.split(';')[0].strip().lower() == 'application/json':
+            return _handle_upload_json(handler, content_length)
         fields, files = parse_multipart(handler.rfile, content_type, content_length)
         session_id = fields.get('session_id', '')
         if 'file' not in files:
@@ -240,6 +248,48 @@ def handle_upload(handler):
         print('[webui] upload error: ' + _tb.format_exc(), flush=True)
         return j(handler, {'error': 'Upload failed'}, status=500)
 
+
+def _handle_upload_json(handler, content_length: int):
+    """Bytes somebody else chose, so the name is treated as hostile."""
+    import base64 as _b64
+    import json as _json
+    body = _json.loads(handler.rfile.read(content_length).decode('utf-8') or '{}')
+    name = str(body.get('name') or '').strip()
+    data = str(body.get('data') or '')
+    kind = 'image' if str(body.get('kind') or '') == 'image' else 'file'
+    mime = str(body.get('mime') or 'application/octet-stream')[:100]
+    if not name or not data:
+        return j(handler, {'error': 'name and data are required'}, status=400)
+    # Base64 inflates by 4/3, so the cap is on the DECODED size -- the number
+    # that decides how much disk this can consume.
+    try:
+        raw = _b64.b64decode(data, validate=True)
+    except Exception:
+        return j(handler, {'error': 'data must be base64'}, status=400)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        return j(handler, {'error': f'File too large (max {MAX_UPLOAD_BYTES//1024//1024}MB)'}, status=413)
+    # Taking the basename means there is no path to traverse in the first
+    # place -- a sanitiser that resolves the path first would happily accept
+    # "sub/../../etc/x" through the right symlink.
+    safe = _re.sub(r'[^A-Za-z0-9._-]', '_', Path(name).name)[:80] or 'upload'
+    if safe.startswith('.'):
+        safe = '_' + safe                       # never a dotfile, never ".."
+    dest_dir = STATE_DIR / 'uploads'
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / safe
+    # Do not silently overwrite something the agent already wrote.
+    stem, suffix, n_ = dest.stem, dest.suffix, 1
+    while dest.exists():
+        dest = dest_dir / f'{stem}-{n_}{suffix}'
+        n_ += 1
+    dest.write_bytes(raw)
+    out = {'path': str(dest), 'kind': kind, 'bytes': len(raw), 'mime': mime}
+    if kind == 'image':
+        # Images travel to the model as a data URL. Kept in the response
+        # rather than re-read at send time, so a path never has to be judged
+        # safe to inline twice.
+        out['url'] = f'data:{mime};base64,{data}'
+    return j(handler, out)
 
 def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
     """Extract a zip or tar archive into the workspace.

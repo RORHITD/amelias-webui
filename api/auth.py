@@ -51,6 +51,10 @@ def _resolve_session_ttl() -> int:
 PUBLIC_PATHS = frozenset({
     '/login', '/health', '/favicon.ico', '/sw.js',
     '/api/auth/login', '/api/auth/status',
+    # Static properties of the build, needed by the phone app WHILE pairing --
+    # before any login exists. Same standing as /api/auth/status: it reveals
+    # what the software can do, never anything about the person running it.
+    '/api/capabilities',
     '/api/auth/oidc/start', '/api/auth/oidc/callback',
     '/api/auth/passkey/options', '/api/auth/passkey/login',
     '/share',
