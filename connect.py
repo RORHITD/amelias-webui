@@ -269,6 +269,7 @@ def pump(api: str, token: str, local: str) -> None:
     ws_url = api.replace("https://", "wss://").replace("http://", "ws://")
     ws = WS.connect(f"{ws_url}/v1/relay/machine?token={token}")
     print(f"  Connected. Serving {local} to your phone. Ctrl-C to stop.")
+    print(f"  To keep this alive after a reboot:  python3 {os.path.abspath(__file__)} --install")
 
     # Idle connections get culled by proxies; a periodic ping keeps it alive.
     stop = threading.Event()
@@ -299,6 +300,106 @@ def pump(api: str, token: str, local: str) -> None:
         ws.close()
 
 
+# ── Staying alive ────────────────────────────────────────────────────────────
+# "Leave that window open" is where a pairing quietly dies: a closed lid or a
+# reboot kills the process, the machine reads "offline" in the app, and nothing
+# anywhere says why. --install hands the keeping-alive to the OS instead.
+
+LABEL = "com.ameliasagent.connect"
+
+
+def _install_service(api: str, local: str) -> None:
+    me = os.path.abspath(__file__)
+    log = os.path.expanduser("~/.amelia/connect.log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    argv = [sys.executable or "python3", me, "--api", api, "--local", local]
+
+    if sys.platform == "darwin":
+        plist = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+        os.makedirs(os.path.dirname(plist), exist_ok=True)
+        lines = "\n".join(f"    <string>{a}</string>" for a in argv)
+        with open(plist, "w") as f:
+            f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key><array>
+{lines}
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+""")
+        # bootout first so a re-install replaces rather than errors; its own
+        # failure means "was not loaded", which is fine.
+        import subprocess
+        uid = os.getuid()
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"],
+                       capture_output=True)
+        r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit(f"launchctl said no: {r.stderr.strip() or r.stdout.strip()}")
+        print(f"  Installed. It now starts with your Mac and restarts if it dies.")
+        print(f"  Log: {log}")
+        print(f"  Remove with: python3 {me} --uninstall")
+        return
+
+    if sys.platform.startswith("linux"):
+        unit = os.path.expanduser("~/.config/systemd/user/amelia-connect.service")
+        os.makedirs(os.path.dirname(unit), exist_ok=True)
+        with open(unit, "w") as f:
+            f.write(f"""[Unit]
+Description=Amelia's Agent connector
+
+[Service]
+ExecStart={" ".join(argv)}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""")
+        import subprocess
+        for cmd in (["systemctl", "--user", "daemon-reload"],
+                    ["systemctl", "--user", "enable", "--now", "amelia-connect"]):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise SystemExit(f"systemctl said no: {r.stderr.strip()}")
+        print("  Installed. It now starts on login and restarts if it dies.")
+        print(f"  Remove with: python3 {me} --uninstall")
+        return
+
+    raise SystemExit("Automatic install only knows macOS and Linux. On Windows, "
+                     "add connect.py to Task Scheduler with 'run at log on'.")
+
+
+def _uninstall_service() -> None:
+    import subprocess
+    if sys.platform == "darwin":
+        plist = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
+                       capture_output=True)
+        try:
+            os.remove(plist)
+        except OSError:
+            pass
+        print("  Removed. The pairing itself is kept; run connect.py to go online again.")
+        return
+    if sys.platform.startswith("linux"):
+        subprocess.run(["systemctl", "--user", "disable", "--now", "amelia-connect"],
+                       capture_output=True)
+        try:
+            os.remove(os.path.expanduser("~/.config/systemd/user/amelia-connect.service"))
+        except OSError:
+            pass
+        print("  Removed. The pairing itself is kept; run connect.py to go online again.")
+        return
+    print("  Nothing to remove on this platform.")
+
+
 def main() -> None:
     # Without this, Python block-buffers stdout whenever it is not a terminal,
     # so under launchd or any `> log` redirect the pairing code sits in a buffer
@@ -314,7 +415,15 @@ def main() -> None:
     p.add_argument("--local", default=DEFAULT_LOCAL, help="host:port of the server on this machine")
     p.add_argument("--name", default=socket.gethostname())
     p.add_argument("--reset", action="store_true", help="forget this machine and pair again")
+    p.add_argument("--install", action="store_true",
+                   help="keep this running: start on login, restart if it dies")
+    p.add_argument("--uninstall", action="store_true", help="remove the login service")
     a = p.parse_args()
+
+    if a.uninstall:
+        return _uninstall_service()
+    if a.install:
+        return _install_service(a.api, a.local)
 
     if a.reset:
         try:
