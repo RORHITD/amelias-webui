@@ -151,6 +151,8 @@ jobs:
 
       - name: Engine contract vs the pinned Agent version
         if: needs.changes.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           REF="$(sed -n 's/^[[:space:]]*max_ref[[:space:]]*=[[:space:]]*//p' UPSTREAM_TESTED_ENGINE | head -n1)"
@@ -161,10 +163,23 @@ jobs:
           echo "Pinned engine ref: $REF"
           # blob:none + sparse keeps this to the Python we actually import: 38MB
           # instead of the ~265MB working tree.
-          git clone --depth 1 --branch "$REF" --filter=blob:none --sparse \
-            https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/engine" \
-            || git clone --depth 1 --branch "$REF" --filter=blob:none --sparse \
-               https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/engine"
+          # hermes-agent is a very large, very popular repo and an anonymous
+          # clone from a CI runner gets HTTP 429'd — that happened on the first
+          # run of this gate. Authenticate (GITHUB_TOKEN lifts the anonymous
+          # rate limit even for another public repo) and back off rather than
+          # retrying instantly into the same throttle.
+          ok=0
+          for attempt in 1 2 3; do
+            rm -rf "$RUNNER_TEMP/engine"
+            if git clone --depth 1 --branch "$REF" --filter=blob:none --sparse \
+                 "https://x-access-token:${GH_TOKEN}@github.com/NousResearch/hermes-agent.git" \
+                 "$RUNNER_TEMP/engine"; then
+              ok=1; break
+            fi
+            echo "clone attempt $attempt failed; backing off" >&2
+            sleep $(( attempt * 15 ))
+          done
+          [ "$ok" = 1 ] || { echo "could not fetch the pinned engine after 3 attempts" >&2; exit 1; }
           # --no-cone, because cone mode accepts directories ONLY: passing a file
           # path makes the whole `sparse-checkout set` abort, and then every engine
           # module reads as missing and this gate is red forever for the wrong
