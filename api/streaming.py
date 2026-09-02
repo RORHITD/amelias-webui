@@ -53,6 +53,7 @@ from api.config import (
     PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
 from api.helpers import (
+    anthropic_response_normalizer,
     redact_session_data,
     scrub_internal_replay_fields,
     _redact_text,
@@ -4440,8 +4441,15 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
                         raw = (assistant_message.content or '') if assistant_message else ''
                         if not raw:
                             empty_status = 'llm_empty'
-                    elif getattr(agent, 'api_mode', '') == 'anthropic_messages':
-                        from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
+                    elif (
+                        getattr(agent, 'api_mode', '') == 'anthropic_messages'
+                        and anthropic_response_normalizer() is not None
+                    ):
+                        # The normalizer does not exist in any engine we ship
+                        # against; when it is absent this falls through to the
+                        # generic path below rather than raising ImportError.
+                        from agent.anthropic_adapter import build_anthropic_kwargs
+                        normalize_anthropic_response = anthropic_response_normalizer()
                         ant_kwargs = build_anthropic_kwargs(
                             model=agent.model,
                             messages=api_messages,

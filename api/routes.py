@@ -2936,6 +2936,7 @@ from api.config import (
 )
 from api import config as api_config
 from api.helpers import (
+    anthropic_response_normalizer,
     require,
     bad,
     safe_resolve,
@@ -28048,9 +28049,16 @@ def _handle_handoff_summary(handler, body):
                 result["incomplete"] = _summary_output_incomplete(result["text"])
                 return result
 
-            if getattr(agent, "api_mode", "") == "anthropic_messages":
-                from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
+            if (
+                getattr(agent, "api_mode", "") == "anthropic_messages"
+                and anthropic_response_normalizer() is not None
+            ):
+                # The normalizer does not exist in any engine we ship against;
+                # when it is absent this block is skipped and the generic path
+                # below runs, instead of raising ImportError.
+                from agent.anthropic_adapter import build_anthropic_kwargs
 
+                normalize_anthropic_response = anthropic_response_normalizer()
                 ant_kwargs = build_anthropic_kwargs(
                     model=agent.model,
                     messages=api_messages,

@@ -14,6 +14,39 @@ from api.config import IMAGE_EXTS, MD_EXTS
 
 logger = logging.getLogger(__name__)
 
+
+def anthropic_response_normalizer():
+    """The Agent's `normalize_anthropic_response`, or None when it is absent.
+
+    Two title/summary generation paths — one in `api/streaming.py`, one in
+    `api/routes.py` — used to do a bare
+
+        from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
+
+    inside the `api_mode == "anthropic_messages"` branch. `build_anthropic_kwargs`
+    exists; **`normalize_anthropic_response` does not** — not in engine 0.20.5 and
+    not in 0.21.0, and `grep -r "def normalize_anthropic_response"` finds it
+    nowhere in the engine at all. The closest real function is
+    `agent/bedrock_adapter.py:normalize_converse_response`, which is a different
+    wire format.
+
+    So every session running a provider in Anthropic-Messages mode raised
+    ImportError there instead of generating a title, and because both call sites
+    sit under a broad `except Exception`, it surfaced as "titles just don't
+    happen" rather than as an error anyone could act on.
+
+    Returning None lets the callers fall through to the generic
+    chat-completions path, which produces a title. Restoring the import as a
+    guarded lookup also means `scripts/check_engine_contract.py` can tell the
+    difference between "we depend on this" and "we cope without it".
+    """
+    try:
+        from agent.anthropic_adapter import normalize_anthropic_response
+    except Exception:
+        return None
+    return normalize_anthropic_response
+
+
 _PUBLIC_MESSAGE_INTERNAL_FIELDS = frozenset({
     "api_content",
     "_row_id",
