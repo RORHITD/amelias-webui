@@ -30,8 +30,12 @@ def test_error_toast_has_copy_button_for_exact_error_text():
 
 
 def test_toast_dismissal_pauses_on_hover_and_keyboard_focus():
-    assert "onmouseenter=()=>clearToastDismissTimer(el)" in UI_JS
-    assert "onmouseleave=()=>setToastDismissTimer(el,duration)" in UI_JS
+    # Hover pause is gated behind a `(hover: none)` media check (#3735 follow-up):
+    # on touch, mouseenter can fire without a matching mouseleave and permanently
+    # cancel the dismiss timer, so the handlers are only wired when real hovering
+    # is possible — same pause-on-hover intent, guarded for touch devices.
+    assert "_canHover?(()=>clearToastDismissTimer(el)):null" in UI_JS
+    assert "_canHover?(()=>setToastDismissTimer(el,duration)):null" in UI_JS
     assert "onfocusin=()=>clearToastDismissTimer(el)" in UI_JS
     assert "onfocusout=()=>setToastDismissTimer(el,duration)" in UI_JS
     # A *visible* toast must remain interactive so hover/focus can pause the

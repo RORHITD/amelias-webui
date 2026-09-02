@@ -10063,7 +10063,18 @@ function _formatUpdateTargetStatus(label,info){
 }
 function _formatManualUpdateInstruction(info){
   if(!(info&&info.no_git&&info.manual_update&&info.behind>0)) return null;
-  return t('settings_update_manual_docker','git -C /path/to/amelias-webui pull && docker compose up -d --build');
+  // no_git means there is no checkout to `git pull` in the first place — this
+  // path only fires for a baked container image, so the fix is a fresh pull of
+  // that image, not a git command against a repo that doesn't exist on disk.
+  //
+  // The image named here is upstream's ON PURPOSE: it is what our own
+  // docker-compose.two-container.yml and .three-container.yml actually pull.
+  // We publish no image of our own — amelias-webui has zero releases and zero
+  // tags, and ghcr.io/rorhitd/amelias-webui answers 403 to an anonymous pull —
+  // so telling a customer to pull it would hand them a command that fails.
+  // If we ever cut a release, change the compose files and this string
+  // together, or they will disagree again.
+  return t('settings_update_manual_docker','docker pull ghcr.io/nesquena/hermes-webui:latest');
 }
 function _formatUpdateCheckError(label,info){
   if(!info||!info.error) return null;

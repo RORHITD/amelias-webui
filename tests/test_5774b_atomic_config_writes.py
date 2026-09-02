@@ -79,6 +79,25 @@ def test_atomic_write_preserves_existing_permissions(tmp_path: Path) -> None:
 
     # Preserve special permission bits too; replacing the inode must not
     # silently discard an administrator's setgid policy on a shared config.
+    #
+    # Whether chmod can even SET S_ISGID on a regular file is not universal:
+    # POSIX/BSD (and macOS in particular) clears it right there in chmod(2)
+    # when the caller's egid isn't a member of the file's group, with no
+    # error raised -- the bit just silently doesn't stick. That's the tmp_path
+    # user/group here, not a bug in _atomic_write_text, so probe the real
+    # behaviour on this filesystem/user before asserting on it.
+    probe = tmp_path / ".setgid_probe"
+    probe.write_text("x", encoding="utf-8")
+    os.chmod(probe, 0o2664)
+    setgid_propagates = bool(os.stat(probe).st_mode & stat.S_ISGID)
+    probe.unlink()
+    if not setgid_propagates:
+        pytest.skip(
+            "chmod cannot set S_ISGID on a regular file for this user/filesystem "
+            "(egid is not a member of the file's group) -- environmental, not a "
+            "defect in _atomic_write_text"
+        )
+
     os.chmod(target, 0o2664)
     _atomic_write_text(target, "model:\n  default: newest\n")
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o2664
