@@ -13,7 +13,7 @@ This is the comprehensive Docker reference. For a 5-minute quickstart, see the [
 
 ### Available Docker tags
 
-The WebUI Docker image is published to `ghcr.io/nesquena/hermes-webui` with these tags:
+The WebUI Docker image is published to `ghcr.io/rorhitd/amelias-webui` with these tags:
 
 | Tag | Channel | Description |
 |---|---|---|
@@ -27,7 +27,7 @@ To track experimental builds in Docker Compose, use the `:experimental` tag:
 ```yaml
 services:
   hermes-webui:
-    image: ghcr.io/nesquena/hermes-webui:experimental
+    image: ghcr.io/rorhitd/amelias-webui:experimental
 ```
 
 > **Note:** updating between `:experimental` builds requires `docker compose pull` followed by `docker compose up -d` — the floating tag is updated only when a new `exp-v*` release is pushed. Experimental builds are not pushed on every commit to the default branch.
@@ -269,7 +269,7 @@ The three-service pattern uses two containers:
 | Service | Image | Ports |
 |---|---|---|
 | `hermes-agent` | `nousresearch/hermes-agent:latest` | 8642 (gateway), 9119 (dashboard) |
-| `hermes-webui` | `ghcr.io/nesquena/hermes-webui:latest` | 8787 (chat UI) |
+| `hermes-webui` | `ghcr.io/rorhitd/amelias-webui:latest` | 8787 (chat UI) |
 
 Example compose snippet (save as `docker-compose.three-service.yml` or inline into your own file):
 
@@ -296,7 +296,7 @@ services:
       - hermes-net
 
   hermes-webui:
-    image: ghcr.io/nesquena/hermes-webui:latest
+    image: ghcr.io/rorhitd/amelias-webui:latest
     container_name: hermes-webui
     depends_on:
       - hermes-agent

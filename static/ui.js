@@ -10067,14 +10067,16 @@ function _formatManualUpdateInstruction(info){
   // path only fires for a baked container image, so the fix is a fresh pull of
   // that image, not a git command against a repo that doesn't exist on disk.
   //
-  // The image named here is upstream's ON PURPOSE: it is what our own
-  // docker-compose.two-container.yml and .three-container.yml actually pull.
-  // We publish no image of our own — amelias-webui has zero releases and zero
-  // tags, and ghcr.io/rorhitd/amelias-webui answers 403 to an anonymous pull —
-  // so telling a customer to pull it would hand them a command that fails.
-  // If we ever cut a release, change the compose files and this string
-  // together, or they will disagree again.
-  return t('settings_update_manual_docker','docker pull ghcr.io/nesquena/hermes-webui:latest');
+  // Ours now. Until v0.1.0 this repo had zero tags and zero releases, so we
+  // published nothing and every Docker path pulled upstream's image — meaning
+  // anyone running Amelia in a container was running Hermes WebUI instead,
+  // with none of our work in it. Verified pullable anonymously before this
+  // string was changed to name it.
+  //
+  // This value and the image in docker-compose.*.yml must move together, and
+  // docker-smoke.yml re-tags its locally built image to this same name so the
+  // compose files resolve during CI. Change one, change all three.
+  return t('settings_update_manual_docker','docker pull ghcr.io/rorhitd/amelias-webui:latest');
 }
 function _formatUpdateCheckError(label,info){
   if(!info||!info.error) return null;

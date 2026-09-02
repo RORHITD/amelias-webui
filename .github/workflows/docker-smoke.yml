@@ -11,7 +11,7 @@ name: Docker smoke
 # Scope (intentionally small for v1):
 #   - 3 compose variants (single, two-container, three-container)
 #   - For multi-container variants, rebuild the local Dockerfile and re-tag
-#     it as ghcr.io/nesquena/hermes-webui:latest BEFORE `up` so the PR's
+#     it as ghcr.io/rorhitd/amelias-webui:latest BEFORE `up` so the PR's
 #     changes to docker_init.bash / Dockerfile actually execute. Without this
 #     the multi-container variants would pull the previous release from GHCR
 #     and silently miss every PR-level regression.
@@ -83,7 +83,7 @@ jobs:
         with:
           context: .
           load: true
-          tags: ghcr.io/nesquena/hermes-webui:latest
+          tags: ghcr.io/rorhitd/amelias-webui:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -111,7 +111,7 @@ jobs:
         with:
           context: .
           load: true
-          tags: ghcr.io/nesquena/hermes-webui:latest
+          tags: ghcr.io/rorhitd/amelias-webui:latest
           cache-from: type=gha
 
       - name: Boot on a host-owned state mount with no explicit IDs
@@ -142,7 +142,7 @@ jobs:
             -p 127.0.0.1:8788:8787 \
             -e HERMES_WEBUI_STATE_DIR=/app/data \
             -v "$STATE_DIR":/app/data \
-            ghcr.io/nesquena/hermes-webui:latest
+            ghcr.io/rorhitd/amelias-webui:latest
           echo "::endgroup::"
 
           # ----- The product gate: the container must reach /health -----
@@ -233,7 +233,7 @@ jobs:
             -e WANTED_GID=1024 \
             -v "$STATE_DIR":/app/data \
             -v "$HERMES_DIR":/home/hermeswebui/.hermes \
-            ghcr.io/nesquena/hermes-webui:latest
+            ghcr.io/rorhitd/amelias-webui:latest
 
           attempts=0
           max_attempts=60
@@ -282,7 +282,7 @@ jobs:
         with:
           context: .
           load: true
-          tags: ghcr.io/nesquena/hermes-webui:latest
+          tags: ghcr.io/rorhitd/amelias-webui:latest
           cache-from: type=gha
 
       - name: Resolve compose file + project name
