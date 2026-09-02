@@ -2607,8 +2607,8 @@ class TestSequentialUpdateRestartCoordination:
 class TestUpdateCompareSource:
     def test_simulated_update_check_payload_includes_both_safe_compare_urls(self):
         src = read('api/routes.py')
-        assert '"repo_url": "https://github.com/nesquena/hermes-webui"' in src
-        assert '"compare_url": "https://github.com/nesquena/hermes-webui/compare/abc1234...def5678"' in src
+        assert '"repo_url": "https://github.com/RORHITD/amelias-webui"' in src
+        assert '"compare_url": "https://github.com/RORHITD/amelias-webui/compare/abc1234...def5678"' in src
         assert '"repo_url": "https://github.com/NousResearch/hermes-agent"' in src
         assert '"compare_url": "https://github.com/NousResearch/hermes-agent/compare/aaa0001...bbb0002"' in src
 

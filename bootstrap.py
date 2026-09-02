@@ -20,6 +20,10 @@ from pathlib import Path
 
 
 INSTALLER_URL = "https://raw.githubusercontent.com/RORHITD/amelias-agent/master/scripts/install.sh"
+
+# Lets someone deliberately run an engine version this WebUI has not been tested
+# against. Same name the checker and UPSTREAM_TESTED_ENGINE use.
+OVERRIDE_UNTESTED_ENGINE = "HERMES_WEBUI_ALLOW_UNTESTED_ENGINE"
 REPO_ROOT = Path(__file__).resolve().parent
 
 
@@ -364,6 +368,64 @@ def install_hermes_agent() -> None:
     )
 
 
+def check_engine_is_tested(agent_dir: Path | None) -> None:
+    """Refuse to start on an engine version nobody has run this WebUI against.
+
+    `install_hermes_agent()` pipes the upstream installer into bash, which means
+    it installs whatever shipped that morning. Upstream ships on the order of
+    5,000 commits per minor release, so without this two people who onboard a
+    week apart get materially different engines and nothing records which.
+
+    Deliberately a refusal with a named override rather than a warning: a
+    warning printed during a noisy first-run bootstrap is a warning nobody
+    reads. `HERMES_WEBUI_ALLOW_UNTESTED_ENGINE=1` is one word to type and it
+    makes the decision yours instead of the installer's.
+
+    Never fatal for its own reasons — a missing checker, a missing pin file or
+    an unreadable engine all fall through to "carry on", because failing to
+    start the server over a broken *guard* would be worse than the drift it
+    guards against.
+    """
+    if _truthy(os.getenv(OVERRIDE_UNTESTED_ENGINE)):
+        return
+    checker = REPO_ROOT / "scripts" / "check_engine_contract.py"
+    if not checker.is_file() or agent_dir is None:
+        return
+
+    # Imported and called in-process rather than shelled out. Spawning a
+    # subprocess here cost a process, a 30s timeout and an assumption about
+    # sys.executable, and it was OBSERVABLE: bootstrap's foreground path is
+    # covered by tests that monkeypatch subprocess.Popen and assert the POSIX
+    # route spawns none, so a `subprocess.run` inside main() broke ten of them.
+    # The module is pure definitions with no import-time side effects.
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_engine_contract", checker)
+        if spec is None or spec.loader is None:
+            return
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        problems = mod.check_version(REPO_ROOT, Path(agent_dir))
+    except Exception:
+        return
+
+    # Nothing wrong, or nothing we could determine. "No pin recorded" and "this
+    # engine layout has no readable __version__" both mean *unknown*, and
+    # refusing to start on unknown would block any machine whose engine is laid
+    # out differently from ours. Only a version we actually read and found out
+    # of range stops anything.
+    if not problems or all(p.startswith(mod.INDETERMINATE) for p in problems):
+        return
+
+    for line in problems:
+        warn(line.rstrip())
+    raise RuntimeError(
+        "Refusing to start on an untested Hermes Agent version. "
+        f"See UPSTREAM_TESTED_ENGINE, or set {OVERRIDE_UNTESTED_ENGINE}=1."
+    )
+
+
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -569,6 +631,8 @@ def main() -> int:
             )
         install_hermes_agent()
         agent_dir = discover_agent_dir()
+
+    check_engine_is_tested(agent_dir)
 
     python_exe = ensure_python_has_webui_deps(discover_launcher_python(agent_dir), agent_dir)
     state_dir = Path(

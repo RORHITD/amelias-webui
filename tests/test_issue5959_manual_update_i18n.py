@@ -28,7 +28,11 @@ def test_manual_update_instruction_uses_translation_helper():
     assert match
     function_source = match.group(0)
     assert "t('settings_update_manual_docker'" in function_source
-    assert "git -C /path/to/amelias-webui pull && docker compose up -d --build" in function_source
+    # This path only fires when `no_git` is set, i.e. there is no checkout to
+    # `git pull` in the first place (a baked container image) — the guidance
+    # has to be a docker pull of the image our own compose files actually
+    # publish/consume, not a git command against a repo that isn't on disk.
+    assert "docker pull ghcr.io/nesquena/hermes-webui:latest" in function_source
     assert "Manual update required" not in function_source
 
 

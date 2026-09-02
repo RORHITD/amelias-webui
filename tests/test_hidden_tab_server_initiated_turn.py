@@ -89,7 +89,11 @@ def test_hidden_poll_hits_session_status_and_attaches_as_replay():
     """
     start = MESSAGES_JS.find("function _startHiddenActiveStreamPoll(sid)")
     assert start != -1
-    body = MESSAGES_JS[start:start + 2400]
+    # Window 3200, not 2400: the multi-pane bounded-retry follow-up (see
+    # test_poll_stops_only_when_attach_succeeds) inserted an explanatory
+    # comment block between the fetch and the attach call, pushing the
+    # attach past a narrower slice.
+    body = MESSAGES_JS[start:start + 3200]
     assert "api/session/status?session_id=" in body
     assert "d.active_stream_id" in body
     # attaches as replay (recovered=true) — turn is already mid-flight

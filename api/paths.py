@@ -231,16 +231,25 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
                 os.unlink(tmp)
                 _write_in_place()
                 return
-        if mode is not None and hasattr(os, "fchmod"):
-            os.fchmod(fd, mode)
-        elif mode is not None:
-            os.chmod(tmp, mode)
         f = os.fdopen(fd, "w", encoding=encoding)
         owns_fd = False
         with f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+            # Apply the preserved mode AFTER writing, not before: a plain
+            # write(2) to a regular file silently clears S_ISUID/S_ISGID for a
+            # non-privileged writer (the kernel's standard defense against a
+            # setuid/setgid file being repointed at attacker-controlled
+            # content via a chmod/write race). chmod'ing before the write, as
+            # this used to, meant a setgid config.yaml's special bit never
+            # survived a single save regardless of platform. Doing it last
+            # (still before the rename that publishes the new inode) keeps
+            # every mode bit, special bits included.
+            if mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), mode)
+            elif mode is not None:
+                os.chmod(tmp, mode)
         _verify_symlink_target()
         os.replace(tmp, write_path)
         _fsync_directory(write_path.parent)
