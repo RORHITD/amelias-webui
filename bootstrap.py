@@ -20,6 +20,10 @@ from pathlib import Path
 
 
 INSTALLER_URL = "https://raw.githubusercontent.com/RORHITD/amelias-agent/master/scripts/install.sh"
+
+# Lets someone deliberately run an engine version this WebUI has not been tested
+# against. Same name the checker and UPSTREAM_TESTED_ENGINE use.
+OVERRIDE_UNTESTED_ENGINE = "HERMES_WEBUI_ALLOW_UNTESTED_ENGINE"
 REPO_ROOT = Path(__file__).resolve().parent
 
 
@@ -382,24 +386,43 @@ def check_engine_is_tested(agent_dir: Path | None) -> None:
     start the server over a broken *guard* would be worse than the drift it
     guards against.
     """
-    checker = REPO_ROOT / "scripts" / "check_engine_contract.py"
-    if not checker.is_file():
+    if _truthy(os.getenv(OVERRIDE_UNTESTED_ENGINE)):
         return
-    cmd = [sys.executable, str(checker), "--mode", "version", "--repo-root", str(REPO_ROOT)]
-    if agent_dir:
-        cmd += ["--engine-dir", str(agent_dir)]
+    checker = REPO_ROOT / "scripts" / "check_engine_contract.py"
+    if not checker.is_file() or agent_dir is None:
+        return
+
+    # Imported and called in-process rather than shelled out. Spawning a
+    # subprocess here cost a process, a 30s timeout and an assumption about
+    # sys.executable, and it was OBSERVABLE: bootstrap's foreground path is
+    # covered by tests that monkeypatch subprocess.Popen and assert the POSIX
+    # route spawns none, so a `subprocess.run` inside main() broke ten of them.
+    # The module is pure definitions with no import-time side effects.
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_engine_contract", checker)
+        if spec is None or spec.loader is None:
+            return
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        problems = mod.check_version(REPO_ROOT, Path(agent_dir))
     except Exception:
         return
-    if proc.returncode == 0:
+
+    # Nothing wrong, or nothing we could determine. "No pin recorded" and "this
+    # engine layout has no readable __version__" both mean *unknown*, and
+    # refusing to start on unknown would block any machine whose engine is laid
+    # out differently from ours. Only a version we actually read and found out
+    # of range stops anything.
+    if not problems or all(p.startswith(mod.INDETERMINATE) for p in problems):
         return
-    for line in (proc.stdout or "").splitlines():
-        if line.strip():
-            warn(line.rstrip())
+
+    for line in problems:
+        warn(line.rstrip())
     raise RuntimeError(
         "Refusing to start on an untested Hermes Agent version. "
-        "See UPSTREAM_TESTED_ENGINE, or set HERMES_WEBUI_ALLOW_UNTESTED_ENGINE=1."
+        f"See UPSTREAM_TESTED_ENGINE, or set {OVERRIDE_UNTESTED_ENGINE}=1."
     )
 
 

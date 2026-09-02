@@ -343,6 +343,16 @@ def engine_version(engine_dir: Path) -> tuple[int, int, int] | None:
     return None
 
 
+# A verdict we could not reach is not a violation. "The pin is missing" and "this
+# engine layout has no readable __version__" both mean *unknown*, and refusing to
+# start on unknown would block every machine whose engine is laid out differently
+# from ours — a pip install, a distro package, a test harness pointing at a
+# scratch directory. Only a version we actually read and found out of range is a
+# refusal. main() maps these to a distinct exit code so callers can tell the two
+# apart instead of inferring it from the message text.
+INDETERMINATE = ("NO PIN", "NO VERSION")
+
+
 def check_version(root: Path, engine_dir: Path) -> list[str]:
     lo, hi = read_pin(root)
     if lo is None and hi is None:
@@ -463,6 +473,25 @@ def self_test() -> int:
             any("TOO OLD" in f for f in check_version(web, eng)),
         )
 
+        # --- indeterminate must NOT be treated as a violation ---
+        # Shipped as a bug once: an engine directory with no readable
+        # __version__ made bootstrap REFUSE TO START. Every test harness
+        # pointing at a scratch dir hit it, and so would any machine whose
+        # engine is laid out differently (a pip install, a distro package).
+        # "We could not tell" and "we checked and it is wrong" are different
+        # answers and only the second may stop a server.
+        (eng / "hermes_cli" / "__init__.py").unlink()
+        unreadable = check_version(web, eng)
+        expect(
+            "an engine with no readable version reports, but as INDETERMINATE",
+            bool(unreadable) and all(p.startswith(INDETERMINATE) for p in unreadable),
+        )
+        _write(eng / "hermes_cli" / "__init__.py", '__version__ = "0.21.0"\n')
+        expect(
+            "...while a version we CAN read and is out of range is not indeterminate",
+            not all(p.startswith(INDETERMINATE) for p in check_version(web, eng)),
+        )
+
         # --- sabotage 5: a comment that merely MENTIONS an import must not count ---
         # This guard reads its own documentation, so it has to parse code, not text.
         _write(
@@ -533,6 +562,11 @@ def main() -> int:
     if os.getenv(OVERRIDE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
         print(f"  {OVERRIDE_ENV} is set — proceeding anyway.")
         return 0
+    if all(p.startswith(INDETERMINATE) for p in problems):
+        # Nothing was contradicted; we just could not tell. Exit 3 so bootstrap
+        # can carry on while CI, which passes --mode symbols, still fails loudly
+        # on a real breach.
+        return 3
     return 1
 
 
