@@ -364,6 +364,45 @@ def install_hermes_agent() -> None:
     )
 
 
+def check_engine_is_tested(agent_dir: Path | None) -> None:
+    """Refuse to start on an engine version nobody has run this WebUI against.
+
+    `install_hermes_agent()` pipes the upstream installer into bash, which means
+    it installs whatever shipped that morning. Upstream ships on the order of
+    5,000 commits per minor release, so without this two people who onboard a
+    week apart get materially different engines and nothing records which.
+
+    Deliberately a refusal with a named override rather than a warning: a
+    warning printed during a noisy first-run bootstrap is a warning nobody
+    reads. `HERMES_WEBUI_ALLOW_UNTESTED_ENGINE=1` is one word to type and it
+    makes the decision yours instead of the installer's.
+
+    Never fatal for its own reasons — a missing checker, a missing pin file or
+    an unreadable engine all fall through to "carry on", because failing to
+    start the server over a broken *guard* would be worse than the drift it
+    guards against.
+    """
+    checker = REPO_ROOT / "scripts" / "check_engine_contract.py"
+    if not checker.is_file():
+        return
+    cmd = [sys.executable, str(checker), "--mode", "version", "--repo-root", str(REPO_ROOT)]
+    if agent_dir:
+        cmd += ["--engine-dir", str(agent_dir)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception:
+        return
+    if proc.returncode == 0:
+        return
+    for line in (proc.stdout or "").splitlines():
+        if line.strip():
+            warn(line.rstrip())
+    raise RuntimeError(
+        "Refusing to start on an untested Hermes Agent version. "
+        "See UPSTREAM_TESTED_ENGINE, or set HERMES_WEBUI_ALLOW_UNTESTED_ENGINE=1."
+    )
+
+
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -569,6 +608,8 @@ def main() -> int:
             )
         install_hermes_agent()
         agent_dir = discover_agent_dir()
+
+    check_engine_is_tested(agent_dir)
 
     python_exe = ensure_python_has_webui_deps(discover_launcher_python(agent_dir), agent_dir)
     state_dir = Path(

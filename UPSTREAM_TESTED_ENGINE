@@ -1,0 +1,58 @@
+# Which Hermes Agent engine versions this WebUI has actually been tested against.
+#
+# Why this file exists
+# --------------------
+# bootstrap.py used to install the engine with `curl -fsSL <installer> | bash`,
+# which means "whatever shipped this morning". Upstream ships on the order of
+# 5,000 commits per minor release, so two customers who onboard a week apart
+# were getting materially different engines and nothing recorded which one.
+#
+# This is the same discipline `amelias-agent-ios` already uses with its
+# UPSTREAM_TESTED_SHA / UPSTREAM_TRIAGED_SHA files: name the version you
+# actually ran, and make anything outside that range a deliberate decision
+# instead of an accident.
+#
+# How it is enforced
+# ------------------
+# `scripts/check_engine_contract.py --mode version` reads this file, reads the
+# engine's own `hermes_cli/__init__.py:__version__`, and refuses a version
+# outside the range. bootstrap.py calls it before starting the server.
+# Set HERMES_WEBUI_ALLOW_UNTESTED_ENGINE=1 to proceed anyway — the point is
+# that you had to say so.
+#
+# How to widen it
+# ---------------
+# Install the new engine, run `python3 scripts/check_engine_contract.py`
+# (symbol contract) and the WebUI test suite against it, then move `max` and
+# add a line to the log below. Do not widen it because a customer complained
+# that the gate fired; the gate firing is the feature.
+
+min = 0.20.5
+max = 0.20.6
+
+# Upstream's git tags are date-stamped, not semver — 0.20.6 ships as v2026.8.27 —
+# so the tag cannot be derived from the version and has to be recorded next to it.
+# CI clones `max_ref` and runs the symbol contract against it, which is what makes
+# the gate meaningful on a machine that has no engine installed.
+max_ref = v2026.8.27
+
+# Log
+# ---
+# 0.20.5  tested — the version this pin was introduced against.
+# 0.20.6  allowed — patch release in the same 0.20 line.
+# 0.21.0  NOT yet accepted. Released 2026-08-31 ("The Pantheon Release"):
+#         ~5,800 commits and ~869,000 insertions since 0.20.0, including an
+#         explicit "god-file decomposition" refactor of the desktop codebase.
+#
+#         What was checked, 2026-09-01: the tag was shallow-cloned to a scratch
+#         directory (deliberately NOT installed over the working engine) and
+#         `check_engine_contract.py --mode symbols --engine-dir <clone>` run
+#         against it. All 147 names across 44 engine modules still resolve, so
+#         the WebUI will not die on import.
+#
+#         What was NOT checked: any behaviour. The static contract says the
+#         symbols exist, not that they still mean the same thing, and the WebUI
+#         test suite does not load a real engine so running it proves nothing
+#         extra here. The honest next step is to install 0.21.0 somewhere that
+#         is not someone's daily driver and drive a real session through it.
+#         Widen `max` after that, not after this note.

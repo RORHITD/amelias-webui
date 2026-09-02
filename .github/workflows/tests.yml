@@ -134,6 +134,50 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: python3 -m compileall -q api server.py bootstrap.py mcp_server.py tests scripts
 
+      # The WebUI reaches deep into the Agent's source — 245 dependency findings
+      # across 7 classes per scripts/audit_agent_source_dependencies.py, including
+      # leading-underscore names upstream may rename in any commit without it
+      # being a breaking change on their side. That audit only *reports*. This is
+      # the gate: it fails when a name we import stops existing.
+      #
+      # Two parts, deliberately. The self-test needs no engine and proves the
+      # guard still goes red — a guard nobody has watched fail is not evidence.
+      # The contract check needs an engine, so CI fetches the exact version the
+      # repo pins rather than whatever is newest. If the fetch fails, this step
+      # FAILS: a skipped guard that reports green is worse than a red CI.
+      - name: Engine contract self-test (guard must still go red)
+        if: needs.changes.outputs.docs_only != 'true'
+        run: python3 scripts/check_engine_contract.py --self-test
+
+      - name: Engine contract vs the pinned Agent version
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          REF="$(sed -n 's/^[[:space:]]*max_ref[[:space:]]*=[[:space:]]*//p' UPSTREAM_TESTED_ENGINE | head -n1)"
+          if [ -z "$REF" ]; then
+            echo "UPSTREAM_TESTED_ENGINE has no max_ref — cannot check the contract." >&2
+            exit 1
+          fi
+          echo "Pinned engine ref: $REF"
+          # blob:none + sparse keeps this to the Python we actually import: 38MB
+          # instead of the ~265MB working tree.
+          git clone --depth 1 --branch "$REF" --filter=blob:none --sparse \
+            https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/engine" \
+            || git clone --depth 1 --branch "$REF" --filter=blob:none --sparse \
+               https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/engine"
+          # --no-cone, because cone mode accepts directories ONLY: passing a file
+          # path makes the whole `sparse-checkout set` abort, and then every engine
+          # module reads as missing and this gate is red forever for the wrong
+          # reason. `/*.py` rather than a list of top-level modules so a module
+          # upstream adds later is picked up instead of faking a MODULE GONE.
+          git -C "$RUNNER_TEMP/engine" sparse-checkout set --no-cone \
+            '/agent/' '/cron/' '/hermes_cli/' '/tools/' '/*.py'
+          # An under-fetched checkout looks exactly like a deleted module, so
+          # assert the tree actually materialised before believing any verdict.
+          test -f "$RUNNER_TEMP/engine/run_agent.py" \
+            || { echo "sparse checkout did not materialise the engine tree" >&2; exit 1; }
+          python3 scripts/check_engine_contract.py --mode symbols --engine-dir "$RUNNER_TEMP/engine"
+
       - name: Ruff forward gate (new/changed lines only)
         if: needs.changes.outputs.docs_only != 'true'
         run: python3 scripts/ruff_lint.py --diff origin/master
