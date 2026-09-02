@@ -44,6 +44,13 @@ SOURCES = (
     "docker-compose.three-container.yml",
     "static/ui.js",
     ".github/workflows/docker-smoke.yml",
+    # The tests pin the exact banner text, so they name the image too. Left out
+    # of the first version of this guard, and CI immediately found out why:
+    # renaming the image everywhere else turned five test shards red across
+    # three Python versions. A guard that covers the code but not the tests
+    # asserting that code just moves the discovery later.
+    "tests/test_update_banner_fixes.py",
+    "tests/test_issue5959_manual_update_i18n.py",
 )
 
 # Any ghcr reference that looks like this project's WebUI image. Deliberately
@@ -96,10 +103,15 @@ def self_test() -> int:
         root = Path(tmp)
 
         def write_all(image: str) -> None:
-            (root / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
-            (root / "static").mkdir(parents=True, exist_ok=True)
+            # Derive every parent from SOURCES rather than listing directories:
+            # hardcoding ".github/workflows" and "static" meant adding a
+            # tests/ entry to SOURCES made the self-test itself blow up with
+            # FileNotFoundError, which is a fixture that rots the moment the
+            # thing it tests grows.
             for rel in SOURCES:
-                (root / rel).write_text(f"image: {image}:latest\n", encoding="utf-8")
+                path = root / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"image: {image}:latest\n", encoding="utf-8")
 
         write_all(OURS)
         expect("all references agreeing on our image passes", not check(root))
