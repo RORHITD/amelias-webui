@@ -90,7 +90,7 @@ services:
       - hermes-net
 
   hermes-webui:
-    image: ghcr.io/nesquena/hermes-webui:latest
+    image: ghcr.io/rorhitd/amelias-webui:latest
     container_name: hermes-webui
     depends_on:
       - hermes-agent

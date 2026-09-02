@@ -145,6 +145,15 @@ jobs:
       # The contract check needs an engine, so CI fetches the exact version the
       # repo pins rather than whatever is newest. If the fetch fails, this step
       # FAILS: a skipped guard that reports green is worse than a red CI.
+      # The container image is named in the compose files, in the in-app update
+      # hint, and in docker-smoke.yml's re-tag. They must agree, and they must
+      # name an image we actually publish — both have been wrong before.
+      - name: Container image references agree
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          python3 scripts/check_image_refs.py --self-test
+          python3 scripts/check_image_refs.py
+
       - name: Engine contract self-test (guard must still go red)
         if: needs.changes.outputs.docs_only != 'true'
         run: python3 scripts/check_engine_contract.py --self-test

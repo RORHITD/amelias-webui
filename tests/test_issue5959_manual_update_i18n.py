@@ -32,7 +32,7 @@ def test_manual_update_instruction_uses_translation_helper():
     # `git pull` in the first place (a baked container image) — the guidance
     # has to be a docker pull of the image our own compose files actually
     # publish/consume, not a git command against a repo that isn't on disk.
-    assert "docker pull ghcr.io/nesquena/hermes-webui:latest" in function_source
+    assert "docker pull ghcr.io/rorhitd/amelias-webui:latest" in function_source
     assert "Manual update required" not in function_source
 
 
