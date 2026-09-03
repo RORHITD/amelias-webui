@@ -6,6 +6,8 @@ Behavior parity reference: gateway/run.py:_handle_*_command in
 the hermes-agent repo.
 """
 from __future__ import annotations
+
+import time
 import json
 import logging
 import uuid
@@ -1090,7 +1092,38 @@ def session_status(session_id: str) -> dict[str, Any]:
         'output_tokens': out,
         'total_tokens': inp + out,
         'estimated_cost': s.estimated_cost,
+        **_progress_fields(s),
     }
+
+
+def _progress_fields(s) -> dict[str, Any]:
+    """What the running turn is doing, for a poller that cannot hold SSE open.
+
+    Same field names as the hosted sandbox's status (`recent`, `step`,
+    `step_count`, `elapsed`) so the phone app draws both the same way. Read
+    from STREAM_LIVE_TOOL_CALLS, which the streaming worker fills as tools
+    start and finish; empty once the turn is over, when the caller already
+    holds the trail it saw.
+    """
+    try:
+        from api.config import STREAM_LIVE_TOOL_CALLS
+        from api.step_labels import build_trail
+        stream_id = _live_active_stream_id(s)
+        running = bool(stream_id)
+        calls = STREAM_LIVE_TOOL_CALLS.get(stream_id) if stream_id else None
+        recent = build_trail(calls, running=running)
+        started = getattr(s, 'pending_started_at', None)
+        elapsed = round(time.time() - float(started), 1) if (running and started) else 0
+        return {
+            'recent': recent,
+            'step': recent[-1] if recent else '',
+            'step_count': len(calls or []),
+            'elapsed': elapsed,
+        }
+    except Exception:
+        return {'recent': [], 'step': '', 'step_count': 0, 'elapsed': 0}
+
+
 
 
 def session_usage(session_id: str) -> dict[str, Any]:
