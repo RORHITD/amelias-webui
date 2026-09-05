@@ -8892,9 +8892,34 @@ function copyStatusSessionId(btn){
     setTimeout(()=>{btn.innerHTML=orig;btn.classList.remove('copied');},1500);
   }).catch(()=>showToast(t('copy_failed')));
 }
+// Cards that carry their own copyable payload (a tool result, a thinking block,
+// a compression reference). Their copy button must stay scoped to that card —
+// widening it to the turn would hand back the answer instead of the thing the
+// button sits on.
+const _SELF_SCOPED_COPY_CARDS='.tool-card,.thinking-card,.process-wakeup-card,.compression-turn,[data-compression-card]';
+// One agent reply is often several `.assistant-segment` nodes with tool calls in
+// between, so a per-segment copy hands back a fragment of the answer. Gather
+// every text segment of the enclosing turn instead, matching what the iOS app's
+// Copy does (TranscriptTurnCopyComposer).
+function _assistantTurnCopyText(btn){
+  if(!btn||!btn.closest) return '';
+  if(btn.closest(_SELF_SCOPED_COPY_CARDS)) return '';
+  const turn=btn.closest('.assistant-turn');
+  if(!turn) return '';
+  const parts=[];
+  turn.querySelectorAll('.assistant-segment[data-raw-text]').forEach(seg=>{
+    if(seg.closest(_SELF_SCOPED_COPY_CARDS)) return;
+    const text=String(seg.dataset.rawText||'').trim();
+    if(text&&!parts.includes(text)) parts.push(text);
+  });
+  return parts.join('\n\n');
+}
 function copyMsg(btn){
-  const row=btn.closest('[data-raw-text]');
-  const text=row?row.dataset.rawText:'';
+  let text=_assistantTurnCopyText(btn);
+  if(!text){
+    const row=btn.closest('[data-raw-text]');
+    text=row?row.dataset.rawText:'';
+  }
   if(!text)return;
   _copyText(text).then(()=>{
     const orig=btn.innerHTML;btn.innerHTML=li('check',13);btn.style.color='var(--blue)';
