@@ -5635,6 +5635,12 @@ def _csrf_exempt_path(path: str) -> bool:
         "/api/auth/passkey/options",
         "/api/auth/passkey/login",
         "/api/csp-report",
+        # Amelia Bot Teams — see the matching PUBLIC_PATHS comment in
+        # api/auth.py. Neither the machine relay nor the Tauri tray is a
+        # browser fetch, so neither carries a CSRF token.
+        "/api/amelia/bots/run",
+        "/api/amelia/bots/pause",
+        "/api/amelia/bots/capacity/measure",
     }
 
 
@@ -12379,6 +12385,16 @@ def handle_get(handler, parsed) -> bool:
     if proxy_result is not False:
         return proxy_result
 
+    if parsed.path == "/api/amelia/bots/status":
+        from api.amelia_bots import handle_status_request
+        status, payload = handle_status_request(handler)
+        return j(handler, payload, status=status)
+
+    if parsed.path == "/api/amelia/bots/capacity":
+        from api.amelia_bots import handle_capacity_get_request
+        status, payload = handle_capacity_get_request(handler)
+        return j(handler, payload, status=status)
+
     if parsed.path.startswith("/session/static/"):
         # Strip the leading "/session" so _serve_static() sees a path that
         # starts with "/static/" (its required prefix). _serve_static enforces
@@ -14518,6 +14534,27 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         return True
+
+    if parsed.path == "/api/amelia/bots/run":
+        from api.amelia_bots import handle_run_request
+        status, payload = handle_run_request(handler, body)
+        if diag:
+            diag.finish()
+        return j(handler, payload, status=status)
+
+    if parsed.path == "/api/amelia/bots/pause":
+        from api.amelia_bots import handle_pause_request
+        status, payload = handle_pause_request(handler, body)
+        if diag:
+            diag.finish()
+        return j(handler, payload, status=status)
+
+    if parsed.path == "/api/amelia/bots/capacity/measure":
+        from api.amelia_bots import handle_capacity_measure_request
+        status, payload = handle_capacity_measure_request(handler, body)
+        if diag:
+            diag.finish()
+        return j(handler, payload, status=status)
 
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)

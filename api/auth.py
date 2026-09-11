@@ -55,6 +55,18 @@ PUBLIC_PATHS = frozenset({
     # before any login exists. Same standing as /api/auth/status: it reveals
     # what the software can do, never anything about the person running it.
     '/api/capabilities',
+    # Amelia Bot Teams — computer runner. POST /run is reached only through
+    # the machine relay (connect.py `serve_one`), which already authenticated
+    # the websocket at pairing time before it starts forwarding frames — same
+    # standing as /api/capabilities above, not a browser session. The other
+    # four are local-machine controls the Tauri tray calls directly over
+    # loopback (no browser session either). None of these carry account data;
+    # api/amelia_bots.py additionally requires every caller be loopback.
+    '/api/amelia/bots/run',
+    '/api/amelia/bots/status',
+    '/api/amelia/bots/pause',
+    '/api/amelia/bots/capacity',
+    '/api/amelia/bots/capacity/measure',
     '/api/auth/oidc/start', '/api/auth/oidc/callback',
     '/api/auth/passkey/options', '/api/auth/passkey/login',
     '/share',

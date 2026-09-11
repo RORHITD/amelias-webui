@@ -194,9 +194,39 @@ def save_token(token: str, machine_id: str) -> None:
         json.dump({"token": token, "machine_id": machine_id}, f)
 
 
-def enrol(api: str, name: str) -> str:
+def capabilities(local: str) -> dict:
+    """Report what this machine can do, so the server knows before assigning
+    work to it — currently just Bot Teams' computer runner (SPEC.md "How a
+    bot runs -> Computer runner").
+
+    Best-effort and read-only: it only asks the local server's own
+    ``/api/amelia/bots/status`` (added by api/amelia_bots.py) what it already
+    knows, so a local server on an older build that doesn't have that route
+    yet is not fatal — pairing just degrades to no bot support rather than
+    failing.
+    """
+    caps: dict = {"bots": False}
+    try:
+        host, _, port = local.partition(":")
+        conn = http.client.HTTPConnection(host, int(port or 80), timeout=5)
+        conn.request("GET", "/api/amelia/bots/status")
+        res = conn.getresponse()
+        data = res.read()
+        conn.close()
+        if res.status == 200:
+            status = json.loads(data)
+            caps["bots"] = True
+            max_parallel = status.get("max_parallel")
+            if isinstance(max_parallel, int) and max_parallel > 0:
+                caps["max_parallel"] = max_parallel
+    except Exception:
+        pass
+    return caps
+
+
+def enrol(api: str, name: str, local: str = DEFAULT_LOCAL) -> str:
     """Register this machine and show the code that attaches it to an account."""
-    r = post(api, "/v1/machines/code", {"name": name})
+    r = post(api, "/v1/machines/code", {"name": name, "capabilities": capabilities(local)})
     code, token = r["code"], r["token"]
 
     # Saved before the code is shown, not after it is claimed. The machine is
@@ -281,7 +311,24 @@ def pump(api: str, token: str, local: str) -> None:
             except OSError:
                 return
 
+    # Bot Teams' computer runner starts unavailable the moment this process
+    # does and only becomes available once the local server's bot route is up
+    # (or a capacity measurement changes max_parallel) — the one-shot
+    # enrol()-time report can go stale for the life of a long-running
+    # connection. Re-report on the same cadence as the ping so the server's
+    # picture of "can this machine run bots right now" tracks reality without
+    # needing its own timer. Best-effort: an unknown frame type is expected to
+    # be ignored by a server build that predates it, so a send failure here
+    # only costs the next periodic update, never the connection itself.
+    def report_capabilities() -> None:
+        while not stop.wait(25):
+            try:
+                ws.send(json.dumps({"t": "cap", "capabilities": capabilities(local)}))
+            except OSError:
+                return
+
     threading.Thread(target=heartbeat, daemon=True).start()
+    threading.Thread(target=report_capabilities, daemon=True).start()
     try:
         while True:
             msg = ws.recv()
@@ -342,7 +389,7 @@ def _install_service(api: str, local: str) -> None:
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise SystemExit(f"launchctl said no: {r.stderr.strip() or r.stdout.strip()}")
-        print(f"  Installed. It now starts with your Mac and restarts if it dies.")
+        print("  Installed. It now starts with your Mac and restarts if it dies.")
         print(f"  Log: {log}")
         print(f"  Remove with: python3 {me} --uninstall")
         return
@@ -442,7 +489,7 @@ def main() -> None:
             "Start it first:  python3 bootstrap.py"
         )
 
-    token = load_token() or enrol(a.api, a.name)
+    token = load_token() or enrol(a.api, a.name, a.local)
 
     # Reconnect for as long as it takes; a laptop lid or a dropped Wi-Fi should
     # not mean walking back to the terminal.
