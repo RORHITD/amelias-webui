@@ -355,6 +355,48 @@ def test_run_bot_steps_risky_action_becomes_approval_request_not_executed(monkey
     assert not any("sent" in str(kw.get("body", "")).lower() for kw in events)
 
 
+def test_run_bot_steps_run_command_is_only_ever_an_approval_request(monkeypatch):
+    """A model that asks to run a command gets an approval_request and
+    nothing else: no process is started, and no event claims it ran."""
+    monkeypatch.setenv("BOTS_FAKE_MODEL", "1")
+    monkeypatch.setattr(bots, "_fake_model_step", lambda prompt, step, origin: {
+        "tool": "run_command", "args": {"command": "touch /tmp/should-never-exist"}, "origin": "user", "done": True,
+    })
+    started = []
+    import subprocess
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: started.append(a) or (_ for _ in ()).throw(AssertionError("Popen")))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: started.append(a) or (_ for _ in ()).throw(AssertionError("run")))
+    monkeypatch.setattr(os, "system", lambda *a, **kw: started.append(a) or (_ for _ in ()).throw(AssertionError("system")))
+    collector = _Collector()
+    req = {"run_id": "rc1", "prompt": "run it", "posture": "balanced", "bot": {"id": "b1"}, "context": [], "model": None}
+    bots.run_bot_steps(req, collector)
+    approvals = [kw for kind, kw in collector.calls if kind == "approval_request"]
+    assert [a["action"] for a in approvals] == ["run_command"]
+    assert approvals[0]["payload"]["command"] == "touch /tmp/should-never-exist"
+    assert started == []
+    events = [kw for kind, kw in collector.calls if kind == "event"]
+    assert not any("ran" in str(kw.get("body", "")).lower().split() for kw in events)
+
+
+def test_runner_has_no_path_that_executes_a_command():
+    """The computer runner never carries out a risky action itself. The
+    server answers every callback with {approvals:[{id,status}]}; nothing in
+    the runner may read that answer as permission to act, and the module has
+    no way to start a process at all."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(bots))
+    imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
+                for a in (n.names if isinstance(n, ast.Import) else [ast.alias(name=n.module or "")])}
+    assert not imported & {"subprocess", "pty", "pexpect", "shlex"}
+    calls = {f"{n.func.value.id}.{n.func.attr}" for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)}
+    assert not calls & {"os.system", "os.popen", "os.execv", "os.execvp", "os.spawnv", "os.startfile"}
+    # post_callback returns a bool; the server's approvals list is never handed back to the run loop.
+    src = inspect.getsource(bots.post_callback)
+    assert "approvals" not in src
+
+
 def test_run_bot_steps_marks_content_origin_when_context_has_bot_content(monkeypatch):
     monkeypatch.setenv("BOTS_FAKE_MODEL", "1")
     collector = _Collector()

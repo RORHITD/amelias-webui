@@ -321,10 +321,18 @@ def pump(api: str, token: str, local: str) -> None:
     # be ignored by a server build that predates it, so a send failure here
     # only costs the next periodic update, never the connection itself.
     def report_capabilities() -> None:
-        while not stop.wait(25):
+        # "hello" the moment it attaches, then "caps" every 25s: the two frame
+        # types the server reads (noteCapabilities). It silently drops any
+        # other type — "cap" was dropped, so bots=true never reached it — and
+        # the enrol-time capabilities are not stored at all.
+        kind = "hello"
+        while True:
             try:
-                ws.send(json.dumps({"t": "cap", "capabilities": capabilities(local)}))
+                ws.send(json.dumps({"t": kind, "capabilities": capabilities(local)}))
             except OSError:
+                return
+            kind = "caps"
+            if stop.wait(25):
                 return
 
     threading.Thread(target=heartbeat, daemon=True).start()
