@@ -169,34 +169,61 @@ def test_choose_model_endpoint_no_local_no_key_raises(monkeypatch):
         bots.choose_model_endpoint("balanced", None)
 
 
-def test_choose_model_endpoint_skips_provider_with_only_excluded_models(monkeypatch):
-    """A reachable Ollama whose only models are uncensored/roleplay/heretic
-    finetunes must be treated the same as 'no usable local model' — the
-    exact regression this fix is for: the first real run on this box picked
-    an abliterated 35B model because it was simply first in the list."""
+def test_choose_model_endpoint_uses_best_deprioritized_model_when_thats_all_there_is(monkeypatch):
+    """Policy change: a local model is never restricted from availability by
+    name. A reachable Ollama whose only models are uncensored/roleplay/
+    heretic finetunes must still be usable — even in private posture — by
+    picking the best of them, not raising NoLocalModelError."""
     monkeypatch.setattr(bots, "discover_local_models", lambda: [
         {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": [
             "heretic-q4:latest", "qwen3.8-uncensored-orca:latest",
         ]},
     ])
     monkeypatch.setattr(bots, "_own_api_key", lambda: None)
-    with pytest.raises(bots.NoLocalModelError, match="uncensored"):
-        bots.choose_model_endpoint("private", None)
+    endpoint = bots.choose_model_endpoint("private", None)
+    assert endpoint["provider"] == "ollama"
+    assert endpoint["model"] in ("heretic-q4:latest", "qwen3.8-uncensored-orca:latest")
 
 
-def test_choose_model_endpoint_falls_through_to_own_key_when_only_excluded(monkeypatch):
+def test_choose_model_endpoint_prefers_local_deprioritized_model_over_own_key(monkeypatch):
+    """A deprioritized-by-default local model still beats falling through to
+    a cloud key — deprioritization only affects which local model wins, it
+    is not treated as 'no usable local model'."""
     monkeypatch.setattr(bots, "discover_local_models", lambda: [
         {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["heretic-q4:latest"]},
+    ])
+    monkeypatch.setattr(bots, "_own_api_key", lambda: {"provider": "openai", "base_url": "https://api.openai.com", "api_key": "k", "model": "gpt-5.4-mini"})
+    endpoint = bots.choose_model_endpoint("balanced", None)
+    assert endpoint["provider"] == "ollama"
+    assert endpoint["model"] == "heretic-q4:latest"
+
+
+def test_choose_model_endpoint_falls_through_to_own_key_when_only_cannot_chat(monkeypatch):
+    """The one real availability exclusion left: embedding/vision-only
+    models cannot chat at all, so a server offering only those is still
+    treated as 'no usable local model'."""
+    monkeypatch.setattr(bots, "discover_local_models", lambda: [
+        {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["nomic-embed-text:latest"]},
     ])
     monkeypatch.setattr(bots, "_own_api_key", lambda: {"provider": "openai", "base_url": "https://api.openai.com", "api_key": "k", "model": "gpt-5.4-mini"})
     endpoint = bots.choose_model_endpoint("balanced", None)
     assert endpoint["provider"] == "openai"
 
 
-def test_choose_model_endpoint_picks_the_one_allowed_model_among_excluded(monkeypatch):
+def test_choose_model_endpoint_private_posture_raises_only_for_cannot_chat(monkeypatch):
+    monkeypatch.setattr(bots, "discover_local_models", lambda: [
+        {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["nomic-embed-text:latest", "qwen3-vl:latest"]},
+    ])
+    monkeypatch.setattr(bots, "_own_api_key", lambda: None)
+    with pytest.raises(bots.NoLocalModelError, match="cannot chat"):
+        bots.choose_model_endpoint("private", None)
+
+
+def test_choose_model_endpoint_picks_the_one_mainstream_model_among_deprioritized(monkeypatch):
     """Regression proof against the real Ollama list on the dev box this
     feature was built on: qwen3.8-32k must be selectable even sitting next
-    to a pile of excluded finetunes on the same server."""
+    to a pile of deprioritized finetunes and cannot-chat models on the same
+    server."""
     monkeypatch.setattr(bots, "discover_local_models", lambda: [
         {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": [
             "hf.co/PocketAiHub/Ornith-1.5-35B-A3B-Abliterated-GGUF:Q8_0",
@@ -212,7 +239,19 @@ def test_choose_model_endpoint_picks_the_one_allowed_model_among_excluded(monkey
     assert endpoint["model"] == "qwen3.8-32k:latest"
 
 
-# ── unit tests: model selection policy (is_excluded_model / select_model) ──
+def test_choose_model_endpoint_honors_override_of_a_deprioritized_local_model(monkeypatch):
+    """The exact case from the policy change: an override naming a local
+    abliterated model must be honored, not silently swapped for the
+    automatic-default pick."""
+    monkeypatch.setattr(bots, "discover_local_models", lambda: [
+        {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["qwen-abliterated-7b", "qwen-30b"]},
+    ])
+    monkeypatch.setattr(bots, "_own_api_key", lambda: None)
+    endpoint = bots.choose_model_endpoint("private", "qwen-abliterated-7b")
+    assert endpoint["model"] == "qwen-abliterated-7b"
+
+
+# ── unit tests: model selection policy (is_deprioritized_default / cannot_chat / select_model) ──
 
 @pytest.mark.parametrize("name", [
     "hf.co/PocketAiHub/Ornith-1.5-35B-A3B-Abliterated-GGUF:Q8_0",
@@ -223,30 +262,60 @@ def test_choose_model_endpoint_picks_the_one_allowed_model_among_excluded(monkey
     "llama3-roleplay-8b",
     "mixtral-role-play-finetune",
     "RP-Mistral-7B",  # case-insensitive
-    "nomic-embed-text:latest",
-    "qwen3-vl:latest",
-    "",
-    None,
 ])
-def test_is_excluded_model_matches_policy(name):
-    assert bots.is_excluded_model(name) is True
+def test_is_deprioritized_default_matches_policy(name):
+    assert bots.is_deprioritized_default(name) is True
 
 
 @pytest.mark.parametrize("name", [
     "qwen3.8:27b", "qwen3.6:35b-a3b-mtp-q8_0", "gpt-oss-20b", "gemma-2-9b-it",
     "llama-3.1-8b-instruct", "glm-4-9b-chat", "deepseek-v3", "mistral-7b-instruct",
+    "nomic-embed-text:latest",  # cannot_chat's concern, not a preference match
+    "qwen3-vl:latest",
+    "",
+    None,
 ])
-def test_is_excluded_model_allows_general_instruct_models(name):
-    assert bots.is_excluded_model(name) is False
+def test_is_deprioritized_default_allows_everything_else(name):
+    assert bots.is_deprioritized_default(name) is False
 
 
-def test_select_model_excludes_even_when_it_would_sort_first():
+@pytest.mark.parametrize("name", [
+    "nomic-embed-text:latest", "text-embedding-3-small", "qwen3-vl:latest",
+    "llava-vl-7b", "", None,
+])
+def test_cannot_chat_matches_embedding_and_vision_models(name):
+    assert bots.cannot_chat(name) is True
+
+
+@pytest.mark.parametrize("name", [
+    "qwen3.8:27b", "heretic-q4:latest", "qwen-abliterated-7b", "llama-3.1-8b-instruct",
+])
+def test_cannot_chat_allows_chat_capable_models_regardless_of_deprioritization(name):
+    assert bots.cannot_chat(name) is False
+
+
+def test_select_model_prefers_mainstream_even_when_deprioritized_would_sort_first():
     models = ["abliterated-aaa-model", "qwen3.8:27b"]
     assert bots.select_model(models) == "qwen3.8:27b"
 
 
-def test_select_model_returns_none_when_everything_is_excluded():
-    assert bots.select_model(["heretic-q4:latest", "nomic-embed-text:latest"]) is None
+def test_select_model_uses_best_deprioritized_model_when_only_deprioritized_available():
+    """Policy change: never raise/return None merely because every
+    chat-capable candidate's name is deprioritized-by-default — use the
+    best of them instead."""
+    models = ["heretic-q4:latest", "qwen-abliterated-7b"]
+    result = bots.select_model(models)
+    assert result in models
+
+
+def test_select_model_returns_none_only_when_everything_cannot_chat():
+    assert bots.select_model(["nomic-embed-text:latest", "qwen3-vl:latest"]) is None
+
+
+def test_select_model_deprioritized_still_beats_cannot_chat():
+    """A deprioritized-by-default model is still a full local model; an
+    embedding-only model is never a candidate at all."""
+    assert bots.select_model(["heretic-q4:latest", "nomic-embed-text:latest"]) == "heretic-q4:latest"
 
 
 def test_select_model_prefers_an_already_loaded_model():
@@ -269,11 +338,22 @@ def test_select_model_override_wins_when_present_and_allowed():
     assert bots.select_model(models, override="qwen-7b") == "qwen-7b"
 
 
-def test_select_model_ignores_an_excluded_override():
-    """The coordinator's policy must hold even against a user's own
-    override — see choose_model_endpoint's docstring."""
+def test_select_model_honors_a_deprioritized_override():
+    """The exact regression named in the policy change: an override for a
+    local abliterated model must be honored, not silently swapped for the
+    mainstream default. Before this change this incorrectly returned
+    'qwen-30b'."""
     models = ["qwen-30b", "qwen-abliterated-7b"]
-    assert bots.select_model(models, override="qwen-abliterated-7b") == "qwen-30b"
+    assert bots.select_model(models, override="qwen-abliterated-7b") == "qwen-abliterated-7b"
+
+
+def test_select_model_ignores_an_override_that_cannot_chat(monkeypatch):
+    """Unlike deprioritization, cannot_chat is never overridable — an
+    embedding model literally cannot serve chat, so the override falls
+    through to automatic selection instead."""
+    monkeypatch.setattr(bots, "_ollama_loaded_models", lambda *a, **kw: set())
+    models = ["qwen-30b", "nomic-embed-text:latest"]
+    assert bots.select_model(models, override="nomic-embed-text:latest") == "qwen-30b"
 
 
 def test_select_model_is_deterministic_across_repeated_calls():
@@ -302,8 +382,30 @@ def test_status_snapshot_reports_chosen_model(monkeypatch):
             {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["qwen3.8:27b", "heretic-q4:latest"]}
         ])
         snap = bots.status_snapshot()
-        assert snap["local_models"] == ["ollama"]
+        # Every model, unfiltered by preference or exclusion — the
+        # deprioritized-by-default finetune still shows up here.
+        assert snap["local_models"] == ["heretic-q4:latest", "qwen3.8:27b"]
         assert snap["chosen_model"] == "qwen3.8:27b"
+
+
+def test_status_snapshot_local_models_lists_every_model_not_a_filtered_subset(monkeypatch):
+    """Regression proof: local_models must not drop a model by name — not
+    the deprioritized-by-default ones and not the cannot_chat ones either.
+    Deduped across providers, since the same model can be pulled in more
+    than one local server."""
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(bots, "_STATE_PATH", pathlib.Path(tmp) / "state.json")
+        monkeypatch.setattr(bots, "_CAPACITY_PATH", pathlib.Path(tmp) / "capacity.json")
+        monkeypatch.setattr(bots, "discover_local_models", lambda: [
+            {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": [
+                "qwen3.8:27b", "heretic-q4:latest", "nomic-embed-text:latest",
+            ]},
+            {"provider": "lmstudio", "base_url": "http://127.0.0.1:1234", "models": ["qwen3.8:27b", "qwen3-vl:latest"]},
+        ])
+        snap = bots.status_snapshot()
+        assert snap["local_models"] == [
+            "heretic-q4:latest", "nomic-embed-text:latest", "qwen3-vl:latest", "qwen3.8:27b",
+        ]
 
 
 def test_status_snapshot_chosen_model_none_when_nothing_usable(monkeypatch):

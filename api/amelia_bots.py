@@ -421,8 +421,10 @@ def discover_local_models() -> list[dict]:
 
     Unfiltered on purpose — this is also what status_snapshot() reports as
     ``local_models`` for transparency, so it should show everything actually
-    installed. Model *selection* policy (excluding uncensored/roleplay/
-    embedding/vision-only models) lives in ``select_model`` /
+    installed. A model on the user's own computer is never restricted from
+    *availability* by name — the only thing excluded here is a model that
+    cannot chat at all (embedding-only, vision-only). Preferring a mainstream
+    model for the automatic default lives in ``select_model`` /
     ``choose_model_endpoint`` below, applied at the point a model is chosen
     to run something, not at discovery time.
     """
@@ -459,19 +461,26 @@ def _ollama_loaded_models(base_url: str, timeout: float = 2.5) -> set[str]:
 
 # ── model selection policy ───────────────────────────────────────────────────
 #
-# Mirrors the Amelia backend's policy (origin/main commit 375dc8a: "uncensored
-# and role-play fine-tunes are neither listed nor runnable") — a local model
-# a person happens to have pulled for other purposes must not become what a
-# bot silently runs on. Exclusion is content-based (name pattern), not an
-# allowlist, because new uncensored/roleplay finetunes appear constantly and
-# an allowlist would need updating for every one; embedding and vision-only
-# models are excluded because they cannot do the job at all (no chat
-# capability), not for a safety reason.
+# Policy change from the product owner: models on the user's own computer are
+# never restricted from *availability* — the abliterated/uncensored/roleplay
+# ban that origin/main commit 375dc8a described ("uncensored and role-play
+# fine-tunes are neither listed nor runnable") applied to models served
+# through Amelia's own OpenRouter key (the backend), not to local models the
+# user runs themselves. Here, that name pattern is only a PREFERENCE used to
+# pick the automatic default when nothing else decides (no override, nothing
+# loaded) — see ``is_deprioritized_default``. An explicit override, or a
+# local server whose only chat-capable models match the pattern, still uses
+# them; see ``select_model`` / ``choose_model_endpoint``.
+#
+# Embedding-only and vision-only models are a different, capability-based
+# check (``cannot_chat``) — those are skipped everywhere, including an
+# override, because they cannot do the job at all, not because of a
+# preference.
 
-_EXCLUDED_MODEL_RE = re.compile(
+_DEPRIORITIZED_DEFAULT_RE = re.compile(
     r"abliterat|uncensor|heretic|nsfw|roleplay|role-play|rp-", re.IGNORECASE
 )
-_EXCLUDED_CAPABILITY_RE = re.compile(r"embed|-vl", re.IGNORECASE)
+_CANNOT_CHAT_RE = re.compile(r"embed|-vl", re.IGNORECASE)
 
 # Known general-instruct model families, ranked by preference when nothing
 # else (loaded state, an explicit override) decides it. Order is a judgment
@@ -484,16 +493,30 @@ _MID_SIZE_TARGET_B = 30.0  # "a mid-size quant" — not the biggest, not the sma
 _MID_QUANT_TARGET_BITS = 5  # q4/q5 balance speed and quality; q2 degrades, q8 is slow
 
 
-def is_excluded_model(name: str) -> bool:
-    """True when *name* must never be auto-selected to run a bot step.
+def is_deprioritized_default(name: str) -> bool:
+    """True when *name* should be passed over for the AUTOMATIC default pick
+    (no override given, nothing else decides) in favor of a mainstream
+    instruct model — never a restriction on availability. An explicit
+    override, or a local server where every chat-capable model matches this,
+    still selects one of these — see ``select_model``.
 
     Pure and name-based only — it never makes a network call — so it is
     cheap enough to call on every candidate and easy to unit-test against
-    the exact list SPEC's policy names.
+    the exact list of preference-deprioritized name patterns.
     """
     if not name:
+        return False
+    return bool(_DEPRIORITIZED_DEFAULT_RE.search(name))
+
+
+def cannot_chat(name: str) -> bool:
+    """True when *name* cannot serve as a chat model at all — embedding-only
+    or vision-only — a capability fact, not a preference. Skipped
+    everywhere, including against an explicit override, because it simply
+    cannot do the job."""
+    if not name:
         return True
-    return bool(_EXCLUDED_MODEL_RE.search(name) or _EXCLUDED_CAPABILITY_RE.search(name))
+    return bool(_CANNOT_CHAT_RE.search(name))
 
 
 def _model_family(name: str) -> str | None:
@@ -515,26 +538,32 @@ def _model_quant_bits(name: str) -> int | None:
 
 
 def select_model(models: list[str], *, loaded: set[str] | None = None, override: str | None = None) -> str | None:
-    """Pure, deterministic pick from *models*. Returns ``None`` when every
-    candidate is excluded (the caller turns that into the ``no_local_model``
-    path with a friendly message — see ``choose_model_endpoint``).
+    """Pure, deterministic pick from *models*. Returns ``None`` only when
+    every candidate ``cannot_chat`` (embedding-only/vision-only) — never
+    merely because of a name-based preference; the caller turns a ``None``
+    into the ``no_local_model`` path with a friendly message — see
+    ``choose_model_endpoint``.
 
     Order of preference:
-      1. ``override``, if it names a non-excluded model that's present.
+      1. ``override``, if it names a chat-capable model that's present —
+         honored even when the override is a deprioritized-by-default model
+         (e.g. an abliterated one): the user's own local machine, the
+         user's own explicit pick.
       2. A model that's already loaded (``loaded``, from ``GET /api/ps``) —
          free to use right now, no cold-load latency.
-      3. The best-scoring general-instruct model: known family first, then
-         closest to a mid-size parameter count, then closest to a mid
-         quantization — every tiebreak resolved by name so the result is
-         reproducible given the same model list.
+      3. The best-scoring general-instruct model, preferring one NOT
+         deprioritized-by-default (``is_deprioritized_default``) when one is
+         available; if every chat-capable candidate is deprioritized, the
+         best of THOSE is used rather than failing. Scoring: known family
+         first, then closest to a mid-size parameter count, then closest to
+         a mid quantization — every tiebreak resolved by name so the result
+         is reproducible given the same model list.
     """
-    candidates = [m for m in models if m and not is_excluded_model(m)]
+    candidates = [m for m in models if m and not cannot_chat(m)]
     if not candidates:
         return None
     if override and override in candidates:
         return override
-
-    pool = [m for m in candidates if m in (loaded or ())] or candidates
 
     def score(name: str) -> tuple:
         fam = _model_family(name)
@@ -544,6 +573,13 @@ def select_model(models: list[str], *, loaded: set[str] | None = None, override:
         quant = _model_quant_bits(name)
         quant_penalty = abs(quant - _MID_QUANT_TARGET_BITS) if quant is not None else 2
         return (fam_rank, size_penalty, quant_penalty, name)
+
+    preferred = [m for m in candidates if not is_deprioritized_default(m)]
+    # Never fail merely because every chat-capable model's name is
+    # deprioritized-by-default — fall back to the deprioritized pool instead
+    # of returning None.
+    pool_source = preferred or candidates
+    pool = [m for m in pool_source if m in (loaded or ())] or pool_source
 
     return sorted(pool, key=score)[0]
 
@@ -593,30 +629,34 @@ def choose_model_endpoint(posture: str, model_hint: str | None) -> dict:
     local model too (it's free), and only falls back to the user's own
     configured key when no local model is reachable.
 
-    Model choice within a reachable local server excludes uncensored/
-    role-play/embedding/vision-only models (``is_excluded_model``) before
-    anything else runs — see ``select_model``. A server that is reachable
-    but has ONLY excluded models is treated the same as no local model at
-    all: private posture stays local-only and gets ``no_local_model``; every
-    other posture still tries the user's own key.
+    Model choice within a reachable local server never restricts
+    *availability* by name — an abliterated/uncensored/roleplay model is a
+    fully usable local model; it is only deprioritized for the AUTOMATIC
+    default (``is_deprioritized_default``, applied inside ``select_model``)
+    and still wins on an explicit override or when it's the only chat-
+    capable model around. The one real capability exclusion is
+    ``cannot_chat`` (embedding-only/vision-only models). A server that is
+    reachable but has ONLY such models is treated the same as no local
+    model at all: private posture stays local-only and gets
+    ``no_local_model``; every other posture still tries the user's own key.
     """
     local = discover_local_models()
     override = model_hint or get_chosen_model_override()
-    saw_only_excluded = False
+    saw_only_cannot_chat = False
     for provider_entry in local:
         candidates = provider_entry["models"]
-        if candidates and all(is_excluded_model(m) for m in candidates):
-            saw_only_excluded = True
+        if candidates and all(cannot_chat(m) for m in candidates):
+            saw_only_cannot_chat = True
             continue
         loaded = _ollama_loaded_models(provider_entry["base_url"]) if provider_entry["provider"] == "ollama" else set()
         model = select_model(candidates, loaded=loaded, override=override)
         if model:
             return {"provider": provider_entry["provider"], "base_url": provider_entry["base_url"], "model": model, "api_key": None}
 
-    if saw_only_excluded and posture == "private":
+    if saw_only_cannot_chat and posture == "private":
         raise NoLocalModelError(
-            "only uncensored/role-play/embedding/vision-only local models are available — "
-            "Amelia does not run bots on those; pull a general-purpose model to use Private mode"
+            "only embedding/vision-only local models are available (they cannot chat) — "
+            "pull a general-purpose chat model to use Private mode"
         )
 
     if posture == "private":
@@ -630,9 +670,9 @@ def choose_model_endpoint(posture: str, model_hint: str | None) -> dict:
             "model": model_hint or own_key["model"],
             "api_key": own_key["api_key"],
         }
-    if saw_only_excluded:
+    if saw_only_cannot_chat:
         raise NoLocalModelError(
-            "only uncensored/role-play/embedding/vision-only local models are available, "
+            "only embedding/vision-only local models are available (they cannot chat), "
             "and no local API key is configured"
         )
     raise NoLocalModelError("no local model reachable and no local API key configured")
@@ -1057,11 +1097,18 @@ def status_snapshot() -> dict:
         chosen_model = choose_model_endpoint("balanced", None).get("model")
     except NoLocalModelError:
         chosen_model = None
+    # Every model actually discovered, across every reachable provider —
+    # deduped, sorted for a stable order. Nothing here is filtered by name:
+    # not by the automatic-default preference (`is_deprioritized_default`,
+    # which only affects which model auto-selection PICKS, not what's
+    # reported as present) and not by `cannot_chat` either — an embedding/
+    # vision model the user has pulled is still a model on their machine.
+    all_models = sorted({m for entry in local for m in entry.get("models", []) if m})
     return {
         "running": pool["running"],
         "queued": pool["queued"],
         "max_parallel": configured_max_parallel(),
-        "local_models": [m["provider"] for m in local],
+        "local_models": all_models,
         "chosen_model": chosen_model,
         "paused": is_paused(),
     }
@@ -1073,8 +1120,9 @@ def measure_capacity(levels: tuple[int, ...] = (1, 2, 4, 8), samples_per_level: 
 
     Uses the fake model under BOTS_FAKE_MODEL=1 (deterministic, instant) so
     tests can assert the selection logic without real inference; otherwise
-    calls the model `choose_model_endpoint` picks (never an excluded
-    uncensored/role-play/embedding/vision-only model — see `select_model`).
+    calls the model `choose_model_endpoint` picks (never a model that
+    `cannot_chat` — embedding/vision-only — though an uncensored/role-play
+    local model is a perfectly usable pick here; see `select_model`).
 
     The model is warmed with one untimed call BEFORE any timing starts
     (`_warm_model`) — a cold load can be many seconds for a large model, and
@@ -1178,8 +1226,9 @@ def handle_pause_request(handler, body: dict) -> tuple[int, dict]:
 def handle_model_request(handler, body: dict) -> tuple[int, dict]:
     """POST /api/amelia/bots/model {model: string|null} — the override
     GET /api/amelia/bots/status reports back as `chosen_model` once it wins
-    selection (an excluded uncensored/role-play/embedding/vision-only model
-    is accepted here but never actually used — see `select_model`)."""
+    selection. Any local model, including an uncensored/role-play one, is
+    accepted and honored here; an embedding/vision-only model is accepted
+    but never actually used because it `cannot_chat` — see `select_model`."""
     if not is_loopback_client(handler):
         return 403, {"error": "forbidden"}
     if not isinstance(body, dict) or "model" not in body:
