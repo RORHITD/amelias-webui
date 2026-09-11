@@ -12,11 +12,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-import pytest
 
 REPO = pathlib.Path(__file__).parent.parent
 

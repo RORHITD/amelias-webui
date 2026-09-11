@@ -487,7 +487,7 @@ def main() -> None:
         raise SystemExit(
             f"Nothing is listening on {a.local}.\n"
             "Start it first:  python3 bootstrap.py"
-        )
+        ) from None
 
     token = load_token() or enrol(a.api, a.name, a.local)
 

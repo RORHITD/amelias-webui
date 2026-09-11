@@ -125,6 +125,16 @@ class _StaticPageHandler(BaseHTTPRequestHandler):
 
 # ── unit tests: local model discovery / posture ────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _no_real_ollama_ps_probe(monkeypatch):
+    """Every test in this module that doesn't explicitly test
+    `_ollama_loaded_models` itself should stay hermetic — this machine
+    happens to have a real Ollama server on 11434, and without this a
+    "unit" test would silently make a real network call and could pass or
+    fail depending on what's loaded on the developer's box at the time."""
+    monkeypatch.setattr(bots, "_ollama_loaded_models", lambda *a, **kw: set())
+
+
 def test_choose_model_endpoint_prefers_local_over_own_key(monkeypatch):
     monkeypatch.setattr(bots, "discover_local_models", lambda: [
         {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["m1"]}
@@ -157,6 +167,153 @@ def test_choose_model_endpoint_no_local_no_key_raises(monkeypatch):
     monkeypatch.setattr(bots, "_own_api_key", lambda: None)
     with pytest.raises(bots.NoLocalModelError):
         bots.choose_model_endpoint("balanced", None)
+
+
+def test_choose_model_endpoint_skips_provider_with_only_excluded_models(monkeypatch):
+    """A reachable Ollama whose only models are uncensored/roleplay/heretic
+    finetunes must be treated the same as 'no usable local model' — the
+    exact regression this fix is for: the first real run on this box picked
+    an abliterated 35B model because it was simply first in the list."""
+    monkeypatch.setattr(bots, "discover_local_models", lambda: [
+        {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": [
+            "heretic-q4:latest", "qwen3.8-uncensored-orca:latest",
+        ]},
+    ])
+    monkeypatch.setattr(bots, "_own_api_key", lambda: None)
+    with pytest.raises(bots.NoLocalModelError, match="uncensored"):
+        bots.choose_model_endpoint("private", None)
+
+
+def test_choose_model_endpoint_falls_through_to_own_key_when_only_excluded(monkeypatch):
+    monkeypatch.setattr(bots, "discover_local_models", lambda: [
+        {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["heretic-q4:latest"]},
+    ])
+    monkeypatch.setattr(bots, "_own_api_key", lambda: {"provider": "openai", "base_url": "https://api.openai.com", "api_key": "k", "model": "gpt-5.4-mini"})
+    endpoint = bots.choose_model_endpoint("balanced", None)
+    assert endpoint["provider"] == "openai"
+
+
+def test_choose_model_endpoint_picks_the_one_allowed_model_among_excluded(monkeypatch):
+    """Regression proof against the real Ollama list on the dev box this
+    feature was built on: qwen3.8-32k must be selectable even sitting next
+    to a pile of excluded finetunes on the same server."""
+    monkeypatch.setattr(bots, "discover_local_models", lambda: [
+        {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": [
+            "hf.co/PocketAiHub/Ornith-1.5-35B-A3B-Abliterated-GGUF:Q8_0",
+            "heretic-q4:latest",
+            "huihui_ai/qwen3.8-abliterated:27b-q8_0",
+            "qwen3.8-uncensored-orca:latest",
+            "qwen3.8-32k:latest",
+            "qwen3-vl:latest",
+            "nomic-embed-text:latest",
+        ]},
+    ])
+    endpoint = bots.choose_model_endpoint("private", None)
+    assert endpoint["model"] == "qwen3.8-32k:latest"
+
+
+# ── unit tests: model selection policy (is_excluded_model / select_model) ──
+
+@pytest.mark.parametrize("name", [
+    "hf.co/PocketAiHub/Ornith-1.5-35B-A3B-Abliterated-GGUF:Q8_0",
+    "heretic-q4:latest",
+    "huihui_ai/qwen3.8-abliterated:27b-q8_0",
+    "qwen3.8-uncensored-orca:latest",
+    "some-nsfw-chat-model",
+    "llama3-roleplay-8b",
+    "mixtral-role-play-finetune",
+    "RP-Mistral-7B",  # case-insensitive
+    "nomic-embed-text:latest",
+    "qwen3-vl:latest",
+    "",
+    None,
+])
+def test_is_excluded_model_matches_policy(name):
+    assert bots.is_excluded_model(name) is True
+
+
+@pytest.mark.parametrize("name", [
+    "qwen3.8:27b", "qwen3.6:35b-a3b-mtp-q8_0", "gpt-oss-20b", "gemma-2-9b-it",
+    "llama-3.1-8b-instruct", "glm-4-9b-chat", "deepseek-v3", "mistral-7b-instruct",
+])
+def test_is_excluded_model_allows_general_instruct_models(name):
+    assert bots.is_excluded_model(name) is False
+
+
+def test_select_model_excludes_even_when_it_would_sort_first():
+    models = ["abliterated-aaa-model", "qwen3.8:27b"]
+    assert bots.select_model(models) == "qwen3.8:27b"
+
+
+def test_select_model_returns_none_when_everything_is_excluded():
+    assert bots.select_model(["heretic-q4:latest", "nomic-embed-text:latest"]) is None
+
+
+def test_select_model_prefers_an_already_loaded_model():
+    models = ["qwen3.8:27b", "llama-3.1-8b-instruct"]
+    assert bots.select_model(models, loaded={"llama-3.1-8b-instruct"}) == "llama-3.1-8b-instruct"
+
+
+def test_select_model_family_order_breaks_ties_when_nothing_else_decides():
+    # Neither has a parsed size or quant, so family rank is the only signal.
+    assert bots.select_model(["mistral-latest", "qwen-latest"]) == "qwen-latest"
+
+
+def test_select_model_prefers_mid_size_over_the_largest():
+    models = ["qwen-7b", "qwen-30b", "qwen-235b"]
+    assert bots.select_model(models) == "qwen-30b"
+
+
+def test_select_model_override_wins_when_present_and_allowed():
+    models = ["qwen-7b", "qwen-30b"]
+    assert bots.select_model(models, override="qwen-7b") == "qwen-7b"
+
+
+def test_select_model_ignores_an_excluded_override():
+    """The coordinator's policy must hold even against a user's own
+    override — see choose_model_endpoint's docstring."""
+    models = ["qwen-30b", "qwen-abliterated-7b"]
+    assert bots.select_model(models, override="qwen-abliterated-7b") == "qwen-30b"
+
+
+def test_select_model_is_deterministic_across_repeated_calls():
+    models = ["qwen-30b", "llama-30b", "qwen-31b"]
+    results = {bots.select_model(models) for _ in range(20)}
+    assert len(results) == 1
+
+
+# ── unit tests: chosen_model override setting ───────────────────────────────
+
+def test_chosen_model_override_round_trips(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(bots, "_STATE_PATH", pathlib.Path(tmp) / "state.json")
+        assert bots.get_chosen_model_override() is None
+        bots.set_chosen_model_override("qwen3.8:27b")
+        assert bots.get_chosen_model_override() == "qwen3.8:27b"
+        bots.set_chosen_model_override(None)
+        assert bots.get_chosen_model_override() is None
+
+
+def test_status_snapshot_reports_chosen_model(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(bots, "_STATE_PATH", pathlib.Path(tmp) / "state.json")
+        monkeypatch.setattr(bots, "_CAPACITY_PATH", pathlib.Path(tmp) / "capacity.json")
+        monkeypatch.setattr(bots, "discover_local_models", lambda: [
+            {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "models": ["qwen3.8:27b", "heretic-q4:latest"]}
+        ])
+        snap = bots.status_snapshot()
+        assert snap["local_models"] == ["ollama"]
+        assert snap["chosen_model"] == "qwen3.8:27b"
+
+
+def test_status_snapshot_chosen_model_none_when_nothing_usable(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(bots, "_STATE_PATH", pathlib.Path(tmp) / "state.json")
+        monkeypatch.setattr(bots, "_CAPACITY_PATH", pathlib.Path(tmp) / "capacity.json")
+        monkeypatch.setattr(bots, "discover_local_models", lambda: [])
+        monkeypatch.setattr(bots, "_own_api_key", lambda: None)
+        snap = bots.status_snapshot()
+        assert snap["chosen_model"] is None
 
 
 # ── unit tests: run_bot_steps against the fake model ────────────────────────
@@ -262,6 +419,62 @@ def test_measure_capacity_degrades_selection_when_latency_exceeds_budget(monkeyp
         monkeypatch.setattr(bots, "_CAPACITY_PATH", pathlib.Path(tmp) / "capacity.json")
         result = bots.measure_capacity(levels=(1, 2), samples_per_level=1)
     assert result["max_parallel"] == 1
+
+
+def test_measure_capacity_warms_up_exactly_once_before_any_timed_sample(monkeypatch):
+    """The regression this fix exists for: a cold model load landing inside
+    the first timed sample instead of before it. Proven by call count/order
+    rather than by sleeping for real in the test (fast, still deterministic)
+    — see test_warm_model_calls_ollama_native_chat_non_streaming below for
+    the real HTTP shape `_warm_model` sends."""
+    monkeypatch.setenv("BOTS_FAKE_MODEL", "1")
+    monkeypatch.setenv("BOTS_FAKE_MODEL_LATENCY_MS", "5")
+    warm_calls = []
+
+    def spy(endpoint):
+        warm_calls.append(len(warm_calls))
+        # Do NOT actually sleep the real (slow) warm-up delay here — the
+        # point is call count/order, and a real sleep would just make the
+        # suite slower without strengthening the assertion.
+
+    monkeypatch.setattr(bots, "_warm_model", spy)
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(bots, "_CAPACITY_PATH", pathlib.Path(tmp) / "capacity.json")
+        result = bots.measure_capacity(levels=(1, 2, 4), samples_per_level=2)
+    assert len(warm_calls) == 1, "warm-up must run exactly once per measurement, not once per level/sample"
+    # And its (mocked-away) cost must not leak into any level's timing — every
+    # level should still read the fast fake per-call latency, not a warm-up-
+    # inflated one.
+    for level in result["levels"]:
+        assert level["ttft_p95_ms"] < 200
+
+
+def test_warm_model_calls_ollama_native_chat_non_streaming(monkeypatch):
+    """Pins the real request shape: Ollama's NATIVE /api/chat (not the
+    OpenAI-compat surface, which reports neither eval_count nor
+    eval_duration), non-streaming, think disabled, num_predict=1 — a
+    minimal load-forcing call, not a real generation."""
+    calls = []
+
+    class _FakeResponse:
+        def read(self):
+            return b'{"done": true}'
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(json.loads(req.data))
+        assert req.full_url.endswith("/api/chat")
+        return _FakeResponse()
+
+    monkeypatch.setattr(bots.urllib.request, "urlopen", fake_urlopen)
+    bots._warm_model({"provider": "ollama", "base_url": "http://127.0.0.1:11434", "model": "qwen3.8:27b", "api_key": None})
+    assert len(calls) == 1
+    assert calls[0]["stream"] is False
+    assert calls[0]["think"] is False
+    assert calls[0]["options"]["num_predict"] == 1
 
 
 # ── unit tests: pause / state persistence ───────────────────────────────────
@@ -485,3 +698,28 @@ def test_capacity_measure_endpoint_persists_and_get_reflects_it(bots_server):
     status, cap = _get(bots_server, "/api/amelia/bots/capacity")
     assert status == 200
     assert cap["max_parallel"] == result["max_parallel"]
+
+
+def test_status_reports_local_models_and_chosen_model_fields(bots_server):
+    status, snap = _get(bots_server, "/api/amelia/bots/status")
+    assert status == 200
+    assert "local_models" in snap
+    assert "chosen_model" in snap  # None is a valid value; the key must exist either way
+
+
+def test_model_override_round_trips_through_status(bots_server):
+    status, resp = _post(bots_server, "/api/amelia/bots/model", {"model": "qwen3.8:27b"})
+    assert status == 200
+    assert resp["chosen_model_override"] == "qwen3.8:27b"
+    try:
+        status, resp = _post(bots_server, "/api/amelia/bots/model", {"model": None})
+        assert status == 200
+        assert resp["chosen_model_override"] is None
+    finally:
+        _post(bots_server, "/api/amelia/bots/model", {"model": None})
+
+
+def test_model_override_requires_the_field(bots_server):
+    status, resp = _post(bots_server, "/api/amelia/bots/model", {})
+    assert status == 400
+    assert "error" in resp

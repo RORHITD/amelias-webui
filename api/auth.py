@@ -65,6 +65,7 @@ PUBLIC_PATHS = frozenset({
     '/api/amelia/bots/run',
     '/api/amelia/bots/status',
     '/api/amelia/bots/pause',
+    '/api/amelia/bots/model',
     '/api/amelia/bots/capacity',
     '/api/amelia/bots/capacity/measure',
     '/api/auth/oidc/start', '/api/auth/oidc/callback',

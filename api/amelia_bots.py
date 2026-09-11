@@ -35,11 +35,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
-from api.config import STATE_DIR, cfg
+from api.config import STATE_DIR
 
 # ── constants ─────────────────────────────────────────────────────────────
 
@@ -146,6 +145,24 @@ def is_paused() -> bool:
 def set_paused(paused: bool) -> None:
     state = _load_state()
     state["paused"] = bool(paused)
+    _save_state(state)
+
+
+def get_chosen_model_override() -> str | None:
+    """The person's own pick, when they've set one — read by
+    ``choose_model_endpoint`` ahead of the loaded-model/family/size/quant
+    heuristic, and reported back by ``GET /api/amelia/bots/status`` as
+    ``chosen_model`` so the setting is visible, not just settable."""
+    val = _load_state().get("chosen_model_override")
+    return val if isinstance(val, str) and val else None
+
+
+def set_chosen_model_override(model: str | None) -> None:
+    state = _load_state()
+    if model:
+        state["chosen_model_override"] = model
+    else:
+        state.pop("chosen_model_override", None)
     _save_state(state)
 
 
@@ -400,7 +417,15 @@ def _probe_openai_compat(base_url: str, timeout: float = 2.5) -> list[str] | Non
 def discover_local_models() -> list[dict]:
     """Return every reachable local OpenAI-compatible server, each as
     {provider, base_url, models:[...]}. Read-only: never starts or stops a
-    local model server."""
+    local model server.
+
+    Unfiltered on purpose — this is also what status_snapshot() reports as
+    ``local_models`` for transparency, so it should show everything actually
+    installed. Model *selection* policy (excluding uncensored/roleplay/
+    embedding/vision-only models) lives in ``select_model`` /
+    ``choose_model_endpoint`` below, applied at the point a model is chosen
+    to run something, not at discovery time.
+    """
     found: list[dict] = []
     seen_urls: set[str] = set()
     for provider_id, default_base in _LOCAL_CANDIDATES:
@@ -412,6 +437,115 @@ def discover_local_models() -> list[dict]:
             seen_urls.add(base)
             found.append({"provider": provider_id, "base_url": base, "models": models})
     return found
+
+
+def _ollama_loaded_models(base_url: str, timeout: float = 2.5) -> set[str]:
+    """Model names currently loaded in memory, per Ollama's native GET
+    /api/ps (no OpenAI-compatible equivalent exists for this). Read-only —
+    never loads or unloads anything. Returns an empty set for any failure or
+    for a non-Ollama base_url (nothing to ask)."""
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/api/ps")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        return {
+            m.get("name") or m.get("model")
+            for m in (data.get("models") or [])
+            if isinstance(m, dict) and (m.get("name") or m.get("model"))
+        }
+    except Exception:
+        return set()
+
+
+# ── model selection policy ───────────────────────────────────────────────────
+#
+# Mirrors the Amelia backend's policy (origin/main commit 375dc8a: "uncensored
+# and role-play fine-tunes are neither listed nor runnable") — a local model
+# a person happens to have pulled for other purposes must not become what a
+# bot silently runs on. Exclusion is content-based (name pattern), not an
+# allowlist, because new uncensored/roleplay finetunes appear constantly and
+# an allowlist would need updating for every one; embedding and vision-only
+# models are excluded because they cannot do the job at all (no chat
+# capability), not for a safety reason.
+
+_EXCLUDED_MODEL_RE = re.compile(
+    r"abliterat|uncensor|heretic|nsfw|roleplay|role-play|rp-", re.IGNORECASE
+)
+_EXCLUDED_CAPABILITY_RE = re.compile(r"embed|-vl", re.IGNORECASE)
+
+# Known general-instruct model families, ranked by preference when nothing
+# else (loaded state, an explicit override) decides it. Order is a judgment
+# call, not a claim about quality — it only needs to be deterministic.
+_KNOWN_FAMILIES = ("qwen", "gpt-oss", "gemma", "llama", "glm", "deepseek", "mistral")
+
+_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)b(?![a-z0-9])", re.IGNORECASE)
+_QUANT_RE = re.compile(r"q(\d)(?:_[a-z0-9]+)?", re.IGNORECASE)
+_MID_SIZE_TARGET_B = 30.0  # "a mid-size quant" — not the biggest, not the smallest
+_MID_QUANT_TARGET_BITS = 5  # q4/q5 balance speed and quality; q2 degrades, q8 is slow
+
+
+def is_excluded_model(name: str) -> bool:
+    """True when *name* must never be auto-selected to run a bot step.
+
+    Pure and name-based only — it never makes a network call — so it is
+    cheap enough to call on every candidate and easy to unit-test against
+    the exact list SPEC's policy names.
+    """
+    if not name:
+        return True
+    return bool(_EXCLUDED_MODEL_RE.search(name) or _EXCLUDED_CAPABILITY_RE.search(name))
+
+
+def _model_family(name: str) -> str | None:
+    lname = name.lower()
+    for fam in _KNOWN_FAMILIES:
+        if fam in lname:
+            return fam
+    return None
+
+
+def _model_size_b(name: str) -> float | None:
+    m = _SIZE_RE.search(name)
+    return float(m.group(1)) if m else None
+
+
+def _model_quant_bits(name: str) -> int | None:
+    m = _QUANT_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def select_model(models: list[str], *, loaded: set[str] | None = None, override: str | None = None) -> str | None:
+    """Pure, deterministic pick from *models*. Returns ``None`` when every
+    candidate is excluded (the caller turns that into the ``no_local_model``
+    path with a friendly message — see ``choose_model_endpoint``).
+
+    Order of preference:
+      1. ``override``, if it names a non-excluded model that's present.
+      2. A model that's already loaded (``loaded``, from ``GET /api/ps``) —
+         free to use right now, no cold-load latency.
+      3. The best-scoring general-instruct model: known family first, then
+         closest to a mid-size parameter count, then closest to a mid
+         quantization — every tiebreak resolved by name so the result is
+         reproducible given the same model list.
+    """
+    candidates = [m for m in models if m and not is_excluded_model(m)]
+    if not candidates:
+        return None
+    if override and override in candidates:
+        return override
+
+    pool = [m for m in candidates if m in (loaded or ())] or candidates
+
+    def score(name: str) -> tuple:
+        fam = _model_family(name)
+        fam_rank = _KNOWN_FAMILIES.index(fam) if fam else len(_KNOWN_FAMILIES)
+        size = _model_size_b(name)
+        size_penalty = abs(size - _MID_SIZE_TARGET_B) if size is not None else 9999.0
+        quant = _model_quant_bits(name)
+        quant_penalty = abs(quant - _MID_QUANT_TARGET_BITS) if quant is not None else 2
+        return (fam_rank, size_penalty, quant_penalty, name)
+
+    return sorted(pool, key=score)[0]
 
 
 _OWN_KEY_DEFAULTS = (
@@ -458,16 +592,32 @@ def choose_model_endpoint(posture: str, model_hint: str | None) -> dict:
     Private posture = local model only, ever. Every other posture prefers a
     local model too (it's free), and only falls back to the user's own
     configured key when no local model is reachable.
+
+    Model choice within a reachable local server excludes uncensored/
+    role-play/embedding/vision-only models (``is_excluded_model``) before
+    anything else runs — see ``select_model``. A server that is reachable
+    but has ONLY excluded models is treated the same as no local model at
+    all: private posture stays local-only and gets ``no_local_model``; every
+    other posture still tries the user's own key.
     """
     local = discover_local_models()
-    if local:
-        chosen = local[0]
-        model = model_hint if (model_hint and model_hint in chosen["models"]) else (
-            chosen["models"][0] if chosen["models"] else model_hint
+    override = model_hint or get_chosen_model_override()
+    saw_only_excluded = False
+    for provider_entry in local:
+        candidates = provider_entry["models"]
+        if candidates and all(is_excluded_model(m) for m in candidates):
+            saw_only_excluded = True
+            continue
+        loaded = _ollama_loaded_models(provider_entry["base_url"]) if provider_entry["provider"] == "ollama" else set()
+        model = select_model(candidates, loaded=loaded, override=override)
+        if model:
+            return {"provider": provider_entry["provider"], "base_url": provider_entry["base_url"], "model": model, "api_key": None}
+
+    if saw_only_excluded and posture == "private":
+        raise NoLocalModelError(
+            "only uncensored/role-play/embedding/vision-only local models are available — "
+            "Amelia does not run bots on those; pull a general-purpose model to use Private mode"
         )
-        if not model:
-            raise NoLocalModelError("local server has no models loaded")
-        return {"provider": chosen["provider"], "base_url": chosen["base_url"], "model": model, "api_key": None}
 
     if posture == "private":
         raise NoLocalModelError("no local model reachable and posture is private")
@@ -480,6 +630,11 @@ def choose_model_endpoint(posture: str, model_hint: str | None) -> dict:
             "model": model_hint or own_key["model"],
             "api_key": own_key["api_key"],
         }
+    if saw_only_excluded:
+        raise NoLocalModelError(
+            "only uncensored/role-play/embedding/vision-only local models are available, "
+            "and no local API key is configured"
+        )
     raise NoLocalModelError("no local model reachable and no local API key configured")
 
 
@@ -536,6 +691,174 @@ def _call_local_model(endpoint: dict, messages: list[dict], timeout: float = 30.
     if not choices:
         return ""
     return ((choices[0].get("message") or {}).get("content")) or ""
+
+
+# ── timed generation for capacity measurement ────────────────────────────────
+#
+# Deliberately NOT `_call_local_model`: that helper waits for the whole
+# response and returns only text, so its timing includes a cold model load
+# on the very first call and cannot separate "time to first token" from
+# "time to the last one" at all — which is exactly how the first real
+# capacity run on this box misattributed a cold Ollama load to a 35B model's
+# steady-state TTFT. These stream, and the caller is required to warm the
+# model (`_warm_model`) before ever calling them for a timed sample.
+
+def _ollama_chat_timed(base_url: str, model: str, prompt: str, *, warm: bool, timeout: float = 60.0) -> dict:
+    """One call to Ollama's NATIVE /api/chat (not the OpenAI-compat surface):
+    only the native endpoint reports `eval_count`/`eval_duration`, the exact
+    tokens-generated / decode-time pair needed for a real tok/s, and only it
+    accepts `think` to turn off a reasoning model's hidden thinking tokens
+    (which would otherwise inflate both TTFT and the token count).
+
+    ``warm=True`` makes one minimal, untimed, non-streaming call and returns
+    as soon as the server answers — enough to force a cold model into memory
+    without caring about its content. ``warm=False`` streams and returns
+    ``{ttft_s, tok_s}``, with ``tok_s`` computed from eval_count/eval_duration
+    when Ollama reports them and ``None`` when it doesn't (the caller falls
+    back to a chunk-count estimate in that case).
+    """
+    payload: dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "think": False,
+        "options": {"num_predict": 1 if warm else 64},
+    }
+    if warm:
+        payload["stream"] = False
+        req = urllib.request.Request(
+            base_url.rstrip("/") + "/api/chat", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()  # only the load matters; content is discarded
+        return {"ttft_s": None, "tok_s": None}
+
+    payload["stream"] = True
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/api/chat", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    start = time.time()
+    ttft = None
+    eval_count = None
+    eval_duration_ns = None
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw_line in resp:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except ValueError:
+                continue
+            msg = chunk.get("message") or {}
+            # Either a content delta or a reasoning/"thinking" delta counts —
+            # `think: False` above should suppress thinking tokens on models
+            # that honor it, but a model that ignores the flag must not then
+            # report an artificially early TTFT from content that never
+            # actually starts until the hidden reasoning finishes.
+            if ttft is None and (msg.get("content") or msg.get("thinking") or msg.get("reasoning")):
+                ttft = time.time() - start
+            if chunk.get("done"):
+                eval_count = chunk.get("eval_count")
+                eval_duration_ns = chunk.get("eval_duration")
+                break
+    tok_s = None
+    if eval_count and eval_duration_ns:
+        tok_s = eval_count / (eval_duration_ns / 1e9)
+    return {"ttft_s": ttft if ttft is not None else max(time.time() - start, 1e-6), "tok_s": tok_s}
+
+
+def _openai_stream_timed(endpoint: dict, timeout: float = 30.0) -> tuple[float, float]:
+    """Fallback for a local server that only speaks the OpenAI-compatible
+    surface (LM Studio, mlx_lm.server): no `eval_count`/`eval_duration`
+    equivalent is exposed generically, so tok/s is estimated from streamed
+    chunk count over decode time — SPEC's documented fallback — rather than
+    the whole-response/whole-elapsed-time estimate this replaces."""
+    url = endpoint["base_url"].rstrip("/") + "/v1/chat/completions"
+    payload = {
+        "model": endpoint["model"],
+        "messages": [{"role": "user", "content": "Reply with one short word."}],
+        "stream": True,
+        "max_tokens": 64,
+        # Ignored by servers that don't recognize it — harmless either way —
+        # and turns off visible reasoning on the ones that do.
+        "reasoning_effort": "low",
+    }
+    headers = {"Content-Type": "application/json"}
+    if endpoint.get("api_key"):
+        headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    start = time.time()
+    ttft = None
+    chunks = 0
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except ValueError:
+                continue
+            delta = ((obj.get("choices") or [{}])[0].get("delta") or {})
+            if delta.get("content"):
+                if ttft is None:
+                    ttft = time.time() - start
+                chunks += 1
+    elapsed = max(time.time() - start, 1e-6)
+    tok_s = (chunks / elapsed) if chunks else 0.0
+    return (ttft if ttft is not None else elapsed), tok_s
+
+
+def _warm_model(endpoint: dict | None) -> None:
+    """Block until the model is loaded, untimed — called exactly ONCE before
+    any timed sample in `measure_capacity`. Without this, the very first
+    timed call anywhere pays for the cold load (which can be many seconds
+    for a large model) and that cost lands entirely on whichever concurrency
+    level happens to run first, which is how a 35B model read as 3.1 tok/s
+    at n=1 on hardware capable of far more."""
+    if fake_model_enabled():
+        delay = float(os.environ.get("BOTS_FAKE_MODEL_WARMUP_MS", "200")) / 1000.0
+        time.sleep(delay)
+        return
+    if endpoint is None:
+        return
+    if endpoint["provider"] == "ollama":
+        _ollama_chat_timed(endpoint["base_url"], endpoint["model"], "Hi", warm=True, timeout=180.0)
+        return
+    try:
+        _call_local_model(endpoint, [{"role": "user", "content": "Hi"}], timeout=180.0)
+    except Exception:
+        pass  # best-effort — a warm-up failure surfaces properly on the first timed call instead
+
+
+def _timed_generation(endpoint: dict | None, n: int, levels: tuple[int, ...]) -> tuple[float, float]:
+    """One timed short generation. Returns (ttft_seconds, tokens_per_second).
+
+    Under BOTS_FAKE_MODEL, a small deterministic degradation with `n` keeps
+    the capacity-selection tests meaningful (see
+    test_measure_capacity_degrades_selection_when_latency_exceeds_budget)
+    without a real model in the loop.
+    """
+    if fake_model_enabled():
+        delay = float(os.environ.get("BOTS_FAKE_MODEL_LATENCY_MS", "50")) / 1000.0
+        delay *= 1.0 + 0.15 * (n / max(levels))
+        start = time.time()
+        time.sleep(delay)
+        return time.time() - start, 32.0
+
+    if endpoint is None:
+        raise NoLocalModelError("no local model reachable")
+    if endpoint["provider"] == "ollama":
+        r = _ollama_chat_timed(
+            endpoint["base_url"], endpoint["model"], "Reply with one short word.", warm=False, timeout=60.0
+        )
+        return r["ttft_s"], (r["tok_s"] if r["tok_s"] else 0.0)
+    return _openai_stream_timed(endpoint)
 
 
 # ── the tool-calling loop ────────────────────────────────────────────────────
@@ -727,12 +1050,19 @@ def start_run(req: dict) -> None:
 def status_snapshot() -> dict:
     pool = _POOL.status()
     local = discover_local_models()
-    cap = load_capacity()
+    # Discovery-only cost (a couple of tiny HTTP probes, no generation), so
+    # this stays accurate even while BOTS_FAKE_MODEL=1 skips real generation
+    # for actual runs — same as `local_models` above, which is unconditional.
+    try:
+        chosen_model = choose_model_endpoint("balanced", None).get("model")
+    except NoLocalModelError:
+        chosen_model = None
     return {
         "running": pool["running"],
         "queued": pool["queued"],
         "max_parallel": configured_max_parallel(),
         "local_models": [m["provider"] for m in local],
+        "chosen_model": chosen_model,
         "paused": is_paused(),
     }
 
@@ -743,32 +1073,30 @@ def measure_capacity(levels: tuple[int, ...] = (1, 2, 4, 8), samples_per_level: 
 
     Uses the fake model under BOTS_FAKE_MODEL=1 (deterministic, instant) so
     tests can assert the selection logic without real inference; otherwise
-    calls the first reachable local model.
+    calls the model `choose_model_endpoint` picks (never an excluded
+    uncensored/role-play/embedding/vision-only model — see `select_model`).
+
+    The model is warmed with one untimed call BEFORE any timing starts
+    (`_warm_model`) — a cold load can be many seconds for a large model, and
+    without this step that cost lands entirely on whichever concurrency
+    level happens to go first, which is exactly what made the very first
+    measurement on this feature read 3.1 tok/s at n=1 for a model the same
+    hardware can drive much faster once it's actually loaded.
     """
     if fake_model_enabled():
         endpoint = None
     else:
         endpoint = choose_model_endpoint("balanced", None)
 
+    _warm_model(endpoint)
+
     results = []
     for n in levels:
         ttfts = []
         toks = []
 
-        def _one_call():
-            start = time.time()
-            if fake_model_enabled():
-                delay = float(os.environ.get("BOTS_FAKE_MODEL_LATENCY_MS", "50")) / 1000.0
-                delay *= 1.0 + 0.15 * (n / max(levels))  # gentle, deterministic degradation with load
-                time.sleep(delay)
-                ttft = time.time() - start
-                text = "ok " * 8
-            else:
-                t0 = time.time()
-                text = _call_local_model(endpoint, [{"role": "user", "content": "Reply with one short word."}], timeout=20.0)
-                ttft = time.time() - t0
-            elapsed = max(time.time() - start, 1e-6)
-            return ttft, len(text.split()) / elapsed
+        def _one_call(n=n):
+            return _timed_generation(endpoint, n, levels)
 
         for _ in range(samples_per_level):
             threads_results: list[tuple[float, float]] = []
@@ -845,6 +1173,22 @@ def handle_pause_request(handler, body: dict) -> tuple[int, dict]:
         return 400, {"error": "'paused' must be a boolean"}
     set_paused(body["paused"])
     return 200, {"paused": body["paused"]}
+
+
+def handle_model_request(handler, body: dict) -> tuple[int, dict]:
+    """POST /api/amelia/bots/model {model: string|null} — the override
+    GET /api/amelia/bots/status reports back as `chosen_model` once it wins
+    selection (an excluded uncensored/role-play/embedding/vision-only model
+    is accepted here but never actually used — see `select_model`)."""
+    if not is_loopback_client(handler):
+        return 403, {"error": "forbidden"}
+    if not isinstance(body, dict) or "model" not in body:
+        return 400, {"error": "'model' is required (a string, or null to clear it)"}
+    model = body["model"]
+    if model is not None and not isinstance(model, str):
+        return 400, {"error": "'model' must be a string or null"}
+    set_chosen_model_override(model or None)
+    return 200, {"chosen_model_override": get_chosen_model_override()}
 
 
 def handle_capacity_measure_request(handler, body: dict) -> tuple[int, dict]:

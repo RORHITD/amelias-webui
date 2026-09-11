@@ -5640,6 +5640,7 @@ def _csrf_exempt_path(path: str) -> bool:
         # browser fetch, so neither carries a CSRF token.
         "/api/amelia/bots/run",
         "/api/amelia/bots/pause",
+        "/api/amelia/bots/model",
         "/api/amelia/bots/capacity/measure",
     }
 
@@ -14545,6 +14546,13 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/amelia/bots/pause":
         from api.amelia_bots import handle_pause_request
         status, payload = handle_pause_request(handler, body)
+        if diag:
+            diag.finish()
+        return j(handler, payload, status=status)
+
+    if parsed.path == "/api/amelia/bots/model":
+        from api.amelia_bots import handle_model_request
+        status, payload = handle_model_request(handler, body)
         if diag:
             diag.finish()
         return j(handler, payload, status=status)
