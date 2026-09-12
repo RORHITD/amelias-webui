@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Callable
 
 from api.config import STATE_DIR
+from api.error_reporting import report_error
 
 # ── constants ─────────────────────────────────────────────────────────────
 
@@ -1191,6 +1192,35 @@ def _timed_generation(endpoint: dict | None, n: int, levels: tuple[int, ...]) ->
     return _openai_stream_timed(endpoint)
 
 
+# ── crash reporting for the runner loop ──────────────────────────────────────
+#
+# Bot runs execute unattended on a background thread — a failure here has no
+# person watching it happen the way a chat session does; the only trace used
+# to be a short system line in the run's own transcript (see run_bot_steps
+# and start_run below). NoLocalModelError (no local model reachable) and
+# ValidationError (a tool call refused for an expected, user-facing reason —
+# an SSRF-blocked host, a size cap, a bad URL, "paused") are both product
+# events, not bugs — see api/error_reporting.py's own docstring for why they
+# must never be reported, and RULES in the task that added this: an agent
+# declining, a denied approval, a budget limit, or a cancellation is not an
+# exception. Everything else that escapes a tool call's own handling is a
+# real failure worth seeing.
+
+def _report_bot_error(where: str, exc: BaseException, req: dict, **extra) -> None:
+    if isinstance(exc, (ValidationError, NoLocalModelError)):
+        return
+    tags = {
+        "feature": "agents",
+        "runner": "computer",
+        "bot_id": (req.get("bot") or {}).get("id"),
+        "run_id": req.get("run_id"),
+        "posture": req.get("posture"),
+        "model": req.get("model"),
+    }
+    tags.update({k: v for k, v in extra.items() if v is not None})
+    report_error(where, exc, tags)
+
+
 # ── the tool-calling loop ────────────────────────────────────────────────────
 
 def run_bot_steps(req: dict, emit) -> None:
@@ -1223,6 +1253,10 @@ def run_bot_steps(req: dict, emit) -> None:
             try:
                 reply = _call_local_model(endpoint, [{"role": "user", "content": prompt}])
             except Exception as exc:
+                _report_bot_error(
+                    "bots:model_call", exc, req,
+                    provider=(endpoint or {}).get("provider"), step=str(step),
+                )
                 emit("event", kind="system", body=f"model call failed: {exc}", data={})
                 break
             decision = {"tool": "post_message", "args": {"text": reply}, "origin": origin, "done": True}
@@ -1250,11 +1284,13 @@ def run_bot_steps(req: dict, emit) -> None:
                 page = read_page(args.get("url", ""))
                 emit("event", kind="system", body=f"read {page['url']} ({len(page['text'])} chars)", data={})
             except Exception as exc:
+                _report_bot_error("bots:tool:read_page", exc, req, tool="read_page", step=str(step))
                 emit("event", kind="system", body=f"read_page failed: {exc}", data={})
         elif tool == "fetch_media":
             try:
                 media = fetch_media(args.get("url", ""), filename=args.get("filename"), run_id=run_id)
             except Exception as exc:
+                _report_bot_error("bots:tool:fetch_media", exc, req, tool="fetch_media", step=str(step))
                 emit("event", kind="system", body=f"fetch_media failed: {exc}", data={})
             else:
                 try:
@@ -1398,6 +1434,12 @@ def start_run(req: dict) -> None:
         try:
             run_bot_steps(req, emitter)
         except Exception as exc:
+            # This is the backstop: run_bot_steps catches every tool-call and
+            # model-call failure itself (each reported above, at its own call
+            # site), so anything reaching here is a bug in the runner loop's
+            # own control flow, not an expected tool/model failure — always
+            # worth reporting.
+            _report_bot_error("bots:runner", exc, req)
             emitter("event", kind="system", body=f"runner error: {type(exc).__name__}", data={})
             emitter("done", done=True, error="runner_exception")
 

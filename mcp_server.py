@@ -571,7 +571,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not handler:
         return [TextContent(type="text", text=json.dumps(
             {"error": f"Unknown tool: {name}"}, ensure_ascii=False))]
-    return await handler(arguments)
+    # This is the one chokepoint every MCP tool call passes through. Before
+    # this wrapper, an unexpected exception from a handler (a real bug, not
+    # the deliberate {"error": ...} responses each handler already returns
+    # for expected failures) propagated straight into the MCP stdio
+    # transport uninstrumented — visible to whatever MCP client called us,
+    # invisible to anyone watching this machine's own health.
+    try:
+        return await handler(arguments)
+    except Exception as exc:
+        try:
+            from api.error_reporting import report_error
+            report_error("mcp:call_tool", exc, {"surface": "desktop", "tool": name})
+        except Exception:
+            pass
+        return [TextContent(type="text", text=json.dumps(
+            {"error": f"internal error handling '{name}'"}, ensure_ascii=False))]
 
 
 async def main():

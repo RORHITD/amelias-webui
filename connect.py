@@ -23,6 +23,7 @@ import base64
 import http.client
 import json
 import os
+import re
 import secrets
 import socket
 import ssl
@@ -36,6 +37,57 @@ from typing import Optional
 DEFAULT_API = os.environ.get("AMELIA_API", "https://api.ameliasagent.com")
 DEFAULT_LOCAL = os.environ.get("AMELIA_LOCAL", "127.0.0.1:8787")
 STATE = os.path.expanduser("~/.amelia/machine.json")
+
+
+# ── Reporting a crash home ───────────────────────────────────────────────────
+#
+# "Leave that window open" (see the module docstring for _install_service,
+# below) is where a pairing quietly dies: a closed lid, a dropped Wi-Fi, or a
+# real bug in this file all look identical from the outside — nothing but a
+# stale "offline" reads in the app, and the only evidence is a line in
+# ~/.amelia/connect.log on a machine nobody is looking at. This machine
+# already has the one credential that authorizes it to tell Amelia's backend
+# about itself (the machine token used to open the relay), so failures are
+# reported through THAT channel — /v1/machine-error, authenticated the same
+# way as capability/usage reporting — rather than a bare Sentry DSN handed to
+# a script that runs on a stranger's laptop with nothing but the standard
+# library. Self-contained on purpose, exactly like this whole file: connect.py
+# promises "nothing but the standard library", and importing the webui's own
+# api.error_reporting (which pulls in api.helpers and its dependency graph)
+# would break that promise for the one script most likely to be run before
+# anything else is even installed.
+# connect.py is typically kept running for weeks under --install (see
+# _install_service), not one-shot — a flat lifetime cap would mean one bad
+# week of flaky Wi-Fi permanently silences reporting until somebody restarts
+# it. A sliding window instead: at most a handful of reports per hour, so a
+# genuinely wedged reconnect loop is capped without a rare failure months
+# later going unreported because an old cap was already spent.
+_ERROR_REPORT_WINDOW_SECONDS = 3600.0
+_ERROR_REPORT_MAX_PER_WINDOW = 10
+_error_report_times: list = []
+
+
+def report_error(api: str, token: str, where: str, exc: BaseException) -> None:
+    """Best-effort. Never raises, never blocks the caller more than a couple
+    of seconds, and sends only a class name, a fixed label, and a capped
+    message — never the pairing token, never a URL's query string."""
+    if not token:
+        return
+    now = time.time()
+    _error_report_times[:] = [t for t in _error_report_times if now - t < _ERROR_REPORT_WINDOW_SECONDS]
+    if len(_error_report_times) >= _ERROR_REPORT_MAX_PER_WINDOW:
+        return
+    _error_report_times.append(now)
+    try:
+        message = re.sub(r"(\?)[^\s\"']*", r"\1[redacted]", str(exc))[:500]
+        post(api, "/v1/machine-error", {
+            "token": token,
+            "where": where[:60],
+            "kind": type(exc).__name__[:120],
+            "message": message,
+        })
+    except Exception:
+        pass
 
 
 # ── WebSocket, by hand ───────────────────────────────────────────────────────
@@ -518,6 +570,7 @@ def main() -> None:
             return
         except Exception as e:
             print(f"  Lost the connection ({e}). Retrying in {int(backoff)}s…")
+            report_error(a.api, token, "connect:pump", e)
         try:
             time.sleep(backoff)
         except KeyboardInterrupt:

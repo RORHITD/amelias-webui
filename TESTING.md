@@ -68,6 +68,33 @@ without ruff aren't blocked, while CI (which installs ruff) enforces it. The
 diff-scoped gate runs as the `lint` job in `.github/workflows/tests.yml` and is
 also part of the maintainer pre-release pre-gate.
 
+## Error reporting gate (Agents feature crash visibility)
+
+`tests/test_error_reporting.py` is the static + live-wire equivalent of
+amelia-accounts' `scripts/check-sentry.mjs`, scoped to this repo's own
+reporter (`api/error_reporting.py` — stdlib-only, gated on `AMELIA_ERROR_URL`,
+never a Sentry DSN). It asserts, via comment/docstring-stripped source-text
+regexes:
+
+- the reporter is off by default and never imports a Sentry SDK
+- URLs are stripped of query strings, secrets are redacted through this
+  repo's own credential redactor (`api.helpers`' `_redact_fn_cached`), and
+  the home directory is replaced
+- the Agents runner loop (`api/amelia_bots.py`) reports its background-thread
+  backstop and each tool-call failure, tagged `feature=agents,
+  runner=computer`, while explicitly excluding product events
+  (`ValidationError`, `NoLocalModelError`)
+- `api/crash_visibility.py`'s thread/main excepthooks and `mcp_server.py`'s
+  `call_tool` dispatcher both report unexpected exceptions
+- `connect.py` carries its own self-contained reporter (no `api.*` import,
+  keeping its "nothing but the standard library" promise)
+
+It then boots the reporter for real against a local `http.server` sink and
+asserts a report actually reaching the wire carries no secret, no home path,
+and no bare query string, and that unconfigured/product-event/rate-limited
+cases send nothing. Runs in-suite with the rest of `tests/` — no extra setup,
+no live network, no `CHECK_SENTRY_DSN`-style opt-in needed.
+
 ## Automated browser smoke (runtime brick-class gate)
 
 The ESLint guard above catches `const`-reassign / import-assign statically. The
