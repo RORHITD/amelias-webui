@@ -219,6 +219,13 @@ def capabilities(local: str) -> dict:
             max_parallel = status.get("max_parallel")
             if isinstance(max_parallel, int) and max_parallel > 0:
                 caps["max_parallel"] = max_parallel
+            # {direct: bool, extractor: 'yt-dlp'|None} — see
+            # api/amelia_bots.py's media_fetch_capability(). Additive: an
+            # older local server that doesn't report this key just omits it
+            # from caps, same as an older server omitting max_parallel above.
+            media_fetch = status.get("media_fetch")
+            if isinstance(media_fetch, dict):
+                caps["media_fetch"] = media_fetch
     except Exception:
         pass
     return caps

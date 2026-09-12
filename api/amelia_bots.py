@@ -25,9 +25,12 @@ atomic-write convention this mirrors.
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
+import mimetypes
 import os
+import posixpath
 import re
 import socket
 import threading
@@ -47,6 +50,12 @@ _STATE_PATH = BOTS_DIR / "state.json"
 _CAPACITY_PATH = BOTS_DIR / "capacity.json"
 _STATE_LOCK = threading.RLock()
 
+# Per-run downloaded media (see `fetch_media`) — a subdirectory of this
+# module's own existing state directory under STATE_DIR, the same location
+# api/media_snapshots.py's content store uses as its sibling convention,
+# rather than a brand-new top-level directory.
+MEDIA_DIR = BOTS_DIR / "media"
+
 MAX_STEPS = 8
 DEFAULT_MAX_PARALLEL = 2
 RUN_TIMEOUT_SECONDS = 120.0
@@ -57,7 +66,7 @@ RISKY_ACTIONS = frozenset({
     "send_email", "send_message", "post_public", "spend_money", "delete", "run_command",
 })
 # Tools the computer runner is trusted to execute directly — never a risky action.
-SAFE_TOOLS = frozenset({"read_page", "post_message", "update_task", "remember"})
+SAFE_TOOLS = frozenset({"read_page", "post_message", "update_task", "remember", "fetch_media"})
 
 READ_PAGE_MAX_BYTES = 200_000
 READ_PAGE_TIMEOUT_SECONDS = 10.0
@@ -381,6 +390,279 @@ def read_page(url: str) -> dict:
     }
 
 
+# ── fetch_media: download a media file onto THIS machine ────────────────────
+#
+# Richy asked an agent to download a viral video and hand him the file;
+# agents can only produce text today. What a person does with a downloaded
+# file is their own responsibility — the capability is ours to provide, but
+# only onto the user's OWN computer (their hardware, their tools), never onto
+# an Amelia server. This mirrors read_page's SSRF guard (resolve-and-pin,
+# refuse loopback/RFC1918/link-local) plus a size cap and a time cap, and
+# adds one extra guard read_page doesn't need: a redirect must be
+# re-validated at EVERY hop, because a URL that looks public can still 302
+# straight to a private address, and the guard must hold for the byte
+# source actually fetched — not just the URL first typed in.
+
+MEDIA_FETCH_MAX_BYTES_ENV = "BOTS_MEDIA_MAX_BYTES"
+DEFAULT_MEDIA_FETCH_MAX_BYTES = 500 * 1024 * 1024
+MEDIA_FETCH_TIMEOUT_ENV = "BOTS_MEDIA_TIMEOUT_SECONDS"
+DEFAULT_MEDIA_FETCH_TIMEOUT_SECONDS = 300.0
+MEDIA_FETCH_CHUNK_BYTES = 262_144
+
+# Conservative on purpose: these are the content types SPEC calls "direct
+# media" (audio/*, video/*, image/*, or application/pdf and similar).
+# Anything else is treated as a page URL and handed to the local extractor
+# path instead of being downloaded blind.
+_DIRECT_MEDIA_CT_PREFIXES = ("audio/", "video/", "image/")
+_DIRECT_MEDIA_CT_EXACT = frozenset({"application/pdf"})
+
+_FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def media_fetch_max_bytes() -> int:
+    raw = os.environ.get(MEDIA_FETCH_MAX_BYTES_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MEDIA_FETCH_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MEDIA_FETCH_MAX_BYTES
+    return value if value > 0 else DEFAULT_MEDIA_FETCH_MAX_BYTES
+
+
+def media_fetch_timeout_seconds() -> float:
+    raw = os.environ.get(MEDIA_FETCH_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MEDIA_FETCH_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MEDIA_FETCH_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_MEDIA_FETCH_TIMEOUT_SECONDS
+
+
+def _looks_like_direct_media_content_type(content_type: str) -> bool:
+    ct = (content_type or "").strip().lower()
+    if not ct:
+        return False
+    return ct.startswith(_DIRECT_MEDIA_CT_PREFIXES) or ct in _DIRECT_MEDIA_CT_EXACT
+
+
+def _safe_media_dirname(name: str) -> str:
+    cleaned = _FILENAME_SANITIZE_RE.sub("_", str(name or "")).strip("._")
+    return (cleaned or "run")[:100]
+
+
+def _safe_media_filename(filename: str | None, url: str, content_type: str) -> str:
+    candidate = os.path.basename(str(filename or "").strip())
+    if not candidate:
+        parsed = urllib.parse.urlsplit(url)
+        candidate = posixpath.basename(urllib.parse.unquote(parsed.path))
+    candidate = _FILENAME_SANITIZE_RE.sub("_", candidate).strip("._")
+    if not candidate:
+        candidate = "media"
+    if "." not in candidate:
+        ext = mimetypes.guess_extension((content_type or "").split(";")[0].strip())
+        if ext:
+            candidate += ext
+    return candidate[:200]
+
+
+def _safe_media_stem(filename: str | None) -> str | None:
+    if not filename:
+        return None
+    stem = os.path.basename(str(filename)).rsplit(".", 1)[0]
+    stem = _FILENAME_SANITIZE_RE.sub("_", stem).strip("._")
+    return stem or None
+
+
+class _MediaRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows same-scheme http(s) redirects only, re-running the SSRF guard
+    against each hop's target before following it. Without this, a
+    public-looking URL could 302 straight to a private address and the
+    initial-URL check alone would never see it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlsplit(newurl)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValidationError(f"fetch_media refuses a redirect to a non-http(s) target: {newurl}")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        _resolve_pinned_address(parsed.hostname, port)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_media_url(url: str, timeout: float):
+    """SSRF-guarded open of *url*, following only re-validated same-scheme
+    redirects. Returns the open response (caller must close it)."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValidationError("fetch_media url must be http(s)")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    _resolve_pinned_address(parsed.hostname, port)
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Amelia-Bot-Runner/1.0"})
+    opener = urllib.request.build_opener(_MediaRedirectHandler)
+    try:
+        return opener.open(req, timeout=timeout)
+    except ValidationError:
+        raise
+    except (TimeoutError, socket.timeout) as exc:
+        raise ValidationError(
+            f"fetch_media timed out after {timeout:g}s connecting to {url} — "
+            f"set {MEDIA_FETCH_TIMEOUT_ENV} to raise the time cap"
+        ) from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise ValidationError(
+                f"fetch_media timed out after {timeout:g}s connecting to {url} — "
+                f"set {MEDIA_FETCH_TIMEOUT_ENV} to raise the time cap"
+            ) from exc
+        raise ValidationError(f"fetch_media could not reach {url}: {exc.reason}") from exc
+
+
+def _stream_response_to_file(resp, dest_path: Path, *, max_bytes: int, deadline: float) -> int:
+    """Stream *resp* to *dest_path*, enforcing the size cap on ACTUAL bytes
+    seen (never trusting a declared Content-Length alone) and an overall
+    wall-clock deadline (catches a slow trickle whose individual reads never
+    themselves block long enough to trip the socket timeout). tmp+rename so
+    a cap violation or crash never leaves a partial file at the final name."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.parent / f".{dest_path.name}.part"
+    written = 0
+    try:
+        with open(tmp_path, "wb") as f:
+            while True:
+                if time.time() > deadline:
+                    raise ValidationError(
+                        "fetch_media exceeded its time cap while downloading — "
+                        f"set {MEDIA_FETCH_TIMEOUT_ENV} to raise it"
+                    )
+                chunk = resp.read(MEDIA_FETCH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise ValidationError(
+                        f"file exceeded the {max_bytes // (1024 * 1024)}MB size cap mid-download — "
+                        f"set {MEDIA_FETCH_MAX_BYTES_ENV} to raise it"
+                    )
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, dest_path)
+    except BaseException:
+        for p in (tmp_path, dest_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        raise
+    return written
+
+
+def fetch_media(url: str, *, filename: str | None = None, run_id: str) -> dict:
+    """The fetch_media tool: download *url* onto THIS machine, into a
+    per-run folder under MEDIA_DIR, and return
+    ``{path, filename, bytes, mime, duration?}``.
+
+    Direct media (an audio/*, video/*, image/*, or application/pdf
+    Content-Type) is streamed straight through the SSRF-guarded fetch above.
+    Anything else is treated as a page URL and handed to a local ``yt-dlp``
+    install if one is on PATH; if there isn't one, the failure names exactly
+    what's missing and how to install it — never a vague failure, and this
+    never installs it automatically.
+
+    Every failure mode (paused, SSRF refusal, size cap, time cap, missing or
+    failing extractor) raises ValidationError with one clear, human-readable
+    reason the caller can relay to the person as-is.
+    """
+    if is_paused():
+        raise ValidationError("fetch_media is not allowed while the bot runner is paused")
+    if not isinstance(url, str) or not url.strip():
+        raise ValidationError("fetch_media requires a 'url'")
+
+    max_bytes = media_fetch_max_bytes()
+    timeout = media_fetch_timeout_seconds()
+    deadline = time.time() + timeout
+    run_dir = MEDIA_DIR / _safe_media_dirname(run_id)
+
+    resp = _open_media_url(url, timeout)
+    try:
+        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if _looks_like_direct_media_content_type(content_type):
+            declared_len_raw = resp.headers.get("Content-Length")
+            declared_len = None
+            if declared_len_raw is not None:
+                try:
+                    declared_len = int(declared_len_raw)
+                except (TypeError, ValueError):
+                    declared_len = None
+            # A separate `if`, not an `except` branch above: ValidationError
+            # IS-A ValueError, so raising it from inside that try/except
+            # would be caught right back by the same `except ValueError`.
+            if declared_len is not None and declared_len > max_bytes:
+                raise ValidationError(
+                    f"file is larger than the {max_bytes // (1024 * 1024)}MB size cap "
+                    f"(server reports {declared_len} bytes) — "
+                    f"set {MEDIA_FETCH_MAX_BYTES_ENV} to raise it"
+                )
+            dest_name = _safe_media_filename(filename, url, content_type)
+            dest_path = run_dir / dest_name
+            written = _stream_response_to_file(resp, dest_path, max_bytes=max_bytes, deadline=deadline)
+            return {
+                "path": str(dest_path),
+                "filename": dest_name,
+                "bytes": written,
+                "mime": content_type or "application/octet-stream",
+            }
+    finally:
+        resp.close()
+
+    # Not a direct-media Content-Type: this is a page, not a file — extract
+    # with a local yt-dlp install if there is one. (Imported lazily, and
+    # from a dedicated module — see api/amelia_media_extractor.py's
+    # docstring for why the one legitimate subprocess call in this feature
+    # lives outside api/amelia_bots.py.)
+    from api.amelia_media_extractor import ExtractorError, extract_media, extractor_available
+
+    if not extractor_available():
+        raise ValidationError(
+            "this looks like a page, not a direct media file, and fetching it needs a local "
+            "video/audio extractor (yt-dlp) that isn't installed on this machine. Install it "
+            "yourself — e.g. `brew install yt-dlp` or `pip install yt-dlp` — then try again. "
+            "This tool never installs anything for you."
+        )
+    try:
+        result = extract_media(
+            url, run_dir, filename_stem=_safe_media_stem(filename),
+            timeout=max(0.0, deadline - time.time()),
+        )
+    except ExtractorError as exc:
+        raise ValidationError(str(exc)) from exc
+    if result["bytes"] > max_bytes:
+        try:
+            Path(result["path"]).unlink()
+        except OSError:
+            pass
+        raise ValidationError(
+            f"downloaded file was {result['bytes']} bytes, over the "
+            f"{max_bytes // (1024 * 1024)}MB size cap — "
+            f"set {MEDIA_FETCH_MAX_BYTES_ENV} to raise it"
+        )
+    return result
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 # ── local model discovery ────────────────────────────────────────────────────
 #
 # Uniform OpenAI-compatible surface (/v1/models, /v1/chat/completions) —
@@ -683,10 +965,12 @@ def choose_model_endpoint(posture: str, model_hint: str | None) -> dict:
 # Deterministic, no network, $0 — mirrors SPEC.md "Fake model for tests":
 # a scripted reply can contain a tool call. `[[email:a@b.com]]` in the prompt
 # makes the fake model call send_email; `[[mention:Writer]]` makes it post a
-# message mentioning Writer.
+# message mentioning Writer; `[[fetch_media:<url>|<filename>]]` (filename
+# optional) makes it call fetch_media.
 
 _EMAIL_TRIGGER = re.compile(r"\[\[email:([^\]]+)\]\]")
 _MENTION_TRIGGER = re.compile(r"\[\[mention:([^\]]+)\]\]")
+_FETCH_MEDIA_TRIGGER = re.compile(r"\[\[fetch_media:([^\]|]+)(?:\|([^\]]+))?\]\]")
 
 
 def _fake_model_step(prompt: str, step: int, origin: str) -> dict:
@@ -709,6 +993,12 @@ def _fake_model_step(prompt: str, step: int, origin: str) -> dict:
             "origin": "user",
             "done": True,
         }
+    m = _FETCH_MEDIA_TRIGGER.search(prompt)
+    if m:
+        args = {"url": m.group(1)}
+        if m.group(2):
+            args["filename"] = m.group(2)
+        return {"tool": "fetch_media", "args": args, "origin": origin, "done": True}
     return {
         "tool": "post_message",
         "args": {"text": f"(fake model) step {step}: {prompt[:120]}"},
@@ -961,6 +1251,25 @@ def run_bot_steps(req: dict, emit) -> None:
                 emit("event", kind="system", body=f"read {page['url']} ({len(page['text'])} chars)", data={})
             except Exception as exc:
                 emit("event", kind="system", body=f"read_page failed: {exc}", data={})
+        elif tool == "fetch_media":
+            try:
+                media = fetch_media(args.get("url", ""), filename=args.get("filename"), run_id=run_id)
+            except Exception as exc:
+                emit("event", kind="system", body=f"fetch_media failed: {exc}", data={})
+            else:
+                try:
+                    sha256 = _sha256_file(media["path"])
+                except OSError:
+                    sha256 = ""
+                emit(
+                    "event", kind="system",
+                    body=f"fetched {media['filename']} ({media['bytes']} bytes)", data={},
+                )
+                emit(
+                    "attachment",
+                    filename=media["filename"], bytes=media["bytes"],
+                    mime=media["mime"], sha256=sha256, path=media["path"],
+                )
         else:
             emit("event", kind="system", body=f"unknown tool '{tool}' ignored", data={})
 
@@ -1043,6 +1352,10 @@ class _CallbackEmitter:
         self.events: list[dict] = []
         self.approval_requests: list[dict] = []
         self.tasks: list[dict] = []
+        # Files fetch_media saved this run — see api/amelia_bots.py's
+        # fetch_media and SPEC's computer-runner callback shape. Additive: a
+        # server build that predates this key simply ignores it.
+        self.attachments: list[dict] = []
 
     def __call__(self, emit_kind: str, **kw) -> None:
         if emit_kind == "event":
@@ -1057,18 +1370,24 @@ class _CallbackEmitter:
         elif emit_kind == "task":
             self.tasks.append({"title": kw["title"], "status": kw["status"]})
             self._flush(done=False)
+        elif emit_kind == "attachment":
+            self.attachments.append({
+                "filename": kw["filename"], "bytes": kw["bytes"],
+                "mime": kw["mime"], "sha256": kw["sha256"], "path": kw["path"],
+            })
+            self._flush(done=False)
         elif emit_kind == "done":
             self._flush(done=True, error=kw.get("error"))
 
     def _flush(self, *, done: bool, error: str | None = None) -> None:
         payload = {
             "events": self.events, "approval_requests": self.approval_requests,
-            "tasks": self.tasks, "done": done,
+            "tasks": self.tasks, "attachments": self.attachments, "done": done,
         }
         if error:
             payload["error"] = error
         post_callback(self.callback_url, self.token, payload)
-        self.events, self.approval_requests, self.tasks = [], [], []
+        self.events, self.approval_requests, self.tasks, self.attachments = [], [], [], []
 
 
 def start_run(req: dict) -> None:
@@ -1111,7 +1430,23 @@ def status_snapshot() -> dict:
         "local_models": all_models,
         "chosen_model": chosen_model,
         "paused": is_paused(),
+        "media_fetch": media_fetch_capability(),
     }
+
+
+def media_fetch_capability() -> dict:
+    """{direct: true, extractor: 'yt-dlp'|None} — so the server and apps can
+    tell whether THIS machine can fetch media before assigning that work to
+    it. `direct` is always true: the SSRF-guarded direct download path has
+    no external dependency. `extractor` names the page-URL extractor only
+    when one is actually found on PATH right now (never assumed, never
+    installed by this check)."""
+    try:
+        from api.amelia_media_extractor import extractor_available
+        extractor = "yt-dlp" if extractor_available() else None
+    except Exception:
+        extractor = None
+    return {"direct": True, "extractor": extractor}
 
 
 def measure_capacity(levels: tuple[int, ...] = (1, 2, 4, 8), samples_per_level: int = 3) -> dict:

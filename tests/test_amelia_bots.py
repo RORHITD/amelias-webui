@@ -123,6 +123,434 @@ class _StaticPageHandler(BaseHTTPRequestHandler):
         pass
 
 
+# ── unit tests: fetch_media ──────────────────────────────────────────────────
+#
+# The computer-runner tool that downloads a URL onto THIS machine (never an
+# Amelia server) for `POST /api/amelia/bots/run`'s tool loop to hand back as
+# an attachment. Same real-fixture-server strategy as read_page above: the
+# guard itself has dedicated refusal tests against IP-literal targets; the
+# "allow" tests bypass ONLY the initial-URL check (loopback stands in for a
+# real public address) via a monkeypatched `_resolve_pinned_address`, so the
+# download/cap/redirect logic gets real coverage without touching the network.
+
+def _media_handler(config):
+    """Build a BaseHTTPRequestHandler bound to a mutable *config* dict, so
+    each test can describe its response (content type, body, redirect,
+    chunked/delayed body) without a bespoke handler class."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if config.get("action") == "redirect":
+                self.send_response(302)
+                self.send_header("Location", config["location"])
+                self.end_headers()
+                return
+            if config.get("hang_seconds"):
+                time.sleep(config["hang_seconds"])
+            self.send_response(200)
+            self.send_header("Content-Type", config.get("content_type", "audio/mpeg"))
+            if config.get("content_length") is not None:
+                self.send_header("Content-Length", str(config["content_length"]))
+            self.end_headers()
+            chunks = config.get("chunks")
+            if chunks:
+                for chunk, delay in chunks:
+                    if delay:
+                        time.sleep(delay)
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+            else:
+                self.wfile.write(config.get("body", b"fake media bytes"))
+
+        def log_message(self, fmt, *args):
+            pass
+
+    return _Handler
+
+
+class _MediaFixture:
+    def __init__(self, config):
+        self.config = config
+        self.server = HTTPServer(("127.0.0.1", 0), _media_handler(config))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def port(self):
+        return self.server.server_address[1]
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/media"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def media_fixture():
+    config = {}
+    fx = _MediaFixture(config)
+    try:
+        yield fx
+    finally:
+        fx.close()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_media_state(tmp_path, monkeypatch):
+    """Every fetch_media test gets its own MEDIA_DIR and pause state so
+    tests never touch a real ~/.hermes and never see each other's runs."""
+    monkeypatch.setattr(bots, "MEDIA_DIR", tmp_path / "amelia_media")
+    monkeypatch.setattr(bots, "_STATE_PATH", tmp_path / "bots_state.json")
+
+
+@pytest.fixture
+def bypass_ssrf_for(monkeypatch):
+    """Bypass the SSRF guard ONLY for the given (host, port) — everything
+    else (in particular a redirect target) still runs the REAL check, so a
+    test can prove initial-URL fetches work while redirect targets are still
+    validated for real."""
+    real_resolve = bots._resolve_pinned_address
+    allowed = set()
+
+    def fake_resolve(host, port):
+        if (host, port) in allowed:
+            return "127.0.0.1"
+        return real_resolve(host, port)
+
+    monkeypatch.setattr(bots, "_resolve_pinned_address", fake_resolve)
+
+    def _allow(host, port):
+        allowed.add((host, port))
+
+    return _allow
+
+
+def test_fetch_media_direct_download_happy_path(media_fixture, bypass_ssrf_for):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    media_fixture.config.update(content_type="audio/mpeg", body=b"\x00\x01ID3fakemp3bytes")
+    result = bots.fetch_media(media_fixture.url, filename=None, run_id="run_happy")
+    assert result["bytes"] == len(b"\x00\x01ID3fakemp3bytes")
+    assert result["mime"] == "audio/mpeg"
+    assert result["filename"].endswith(".mp3") or result["filename"] == "media.mp3" or "." in result["filename"]
+    saved = pathlib.Path(result["path"])
+    assert saved.is_file()
+    assert saved.read_bytes() == b"\x00\x01ID3fakemp3bytes"
+    assert "run_happy" in str(saved.parent)
+
+
+def test_fetch_media_honors_a_provided_filename(media_fixture, bypass_ssrf_for):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    media_fixture.config.update(content_type="video/mp4", body=b"videobytes")
+    result = bots.fetch_media(media_fixture.url, filename="clip.mp4", run_id="run_named")
+    assert result["filename"] == "clip.mp4"
+    assert pathlib.Path(result["path"]).name == "clip.mp4"
+
+
+def test_fetch_media_rejects_a_path_traversal_filename(media_fixture, bypass_ssrf_for):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    media_fixture.config.update(content_type="image/png", body=b"pngbytes")
+    result = bots.fetch_media(media_fixture.url, filename="../../etc/evil.png", run_id="run_trav")
+    saved = pathlib.Path(result["path"])
+    assert saved.name == "evil.png"
+    assert saved.is_relative_to(bots.MEDIA_DIR)
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:1/x",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://10.1.2.3/x",
+    "http://192.168.1.1/x",
+    "http://[::1]/x",
+])
+def test_fetch_media_refuses_private_network_targets(url):
+    with pytest.raises(bots.ValidationError):
+        bots.fetch_media(url, filename=None, run_id="run_ssrf")
+
+
+def test_fetch_media_refuses_non_http_scheme():
+    with pytest.raises(bots.ValidationError):
+        bots.fetch_media("file:///etc/passwd", filename=None, run_id="run_scheme")
+
+
+def test_fetch_media_refuses_redirect_to_a_private_target(media_fixture, bypass_ssrf_for):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    media_fixture.config.update(action="redirect", location="http://169.254.169.254/evil")
+    with pytest.raises(bots.ValidationError):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_redirect_ssrf")
+
+
+def test_fetch_media_refuses_redirect_off_http_scheme(media_fixture, bypass_ssrf_for):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    media_fixture.config.update(action="redirect", location="file:///etc/passwd")
+    with pytest.raises(bots.ValidationError):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_redirect_scheme")
+
+
+def test_fetch_media_rejects_declared_content_length_over_cap(media_fixture, bypass_ssrf_for, monkeypatch):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setenv(bots.MEDIA_FETCH_MAX_BYTES_ENV, "10")
+    media_fixture.config.update(content_type="video/mp4", content_length=10_000_000, body=b"x" * 20)
+    with pytest.raises(bots.ValidationError, match="size cap"):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_cap_header")
+
+
+def test_fetch_media_rejects_actual_bytes_over_cap_mid_stream(media_fixture, bypass_ssrf_for, monkeypatch):
+    """No (or an understated) Content-Length must not let a large body
+    through — the cap is enforced on bytes actually read, not the header."""
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setenv(bots.MEDIA_FETCH_MAX_BYTES_ENV, "100")
+    media_fixture.config.update(content_type="video/mp4", body=b"x" * 100_000)
+    with pytest.raises(bots.ValidationError, match="size cap"):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_cap_body")
+    # No partial file left behind at the final name.
+    run_dir = bots.MEDIA_DIR / "run_cap_body"
+    if run_dir.exists():
+        assert not any(p.suffix != ".part" and p.is_file() for p in run_dir.iterdir())
+
+
+def test_fetch_media_enforces_time_cap_mid_stream(media_fixture, bypass_ssrf_for, monkeypatch):
+    """A slow trickle whose individual reads never themselves block long
+    enough to trip the per-call socket timeout must still be caught by the
+    overall wall-clock deadline."""
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setenv(bots.MEDIA_FETCH_TIMEOUT_ENV, "0.3")
+    media_fixture.config.update(
+        content_type="audio/mpeg",
+        chunks=[(b"a" * 10, 0.0)] + [(b"a" * 10, 0.15) for _ in range(6)],
+    )
+    with pytest.raises(bots.ValidationError, match="time cap"):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_time_cap")
+
+
+def test_fetch_media_connect_hang_raises_a_clear_timeout_message(media_fixture, bypass_ssrf_for, monkeypatch):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setenv(bots.MEDIA_FETCH_TIMEOUT_ENV, "0.2")
+    media_fixture.config.update(hang_seconds=2.0)
+    with pytest.raises(bots.ValidationError, match="timed out"):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_hang")
+
+
+def test_fetch_media_respects_the_pause_switch(monkeypatch):
+    bots.set_paused(True)
+    try:
+        with pytest.raises(bots.ValidationError, match="paused"):
+            bots.fetch_media("http://example.com/x.mp3", filename=None, run_id="run_paused")
+    finally:
+        bots.set_paused(False)
+
+
+def test_fetch_media_page_url_with_no_extractor_gives_actionable_message(media_fixture, bypass_ssrf_for, monkeypatch):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setattr("api.amelia_media_extractor.extractor_available", lambda: False)
+    media_fixture.config.update(content_type="text/html", body=b"<html>a page, not a file</html>")
+    with pytest.raises(bots.ValidationError) as excinfo:
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_no_extractor")
+    msg = str(excinfo.value).lower()
+    assert "yt-dlp" in msg
+    assert "install" in msg
+
+
+def test_fetch_media_page_url_with_extractor_present_but_failing(media_fixture, bypass_ssrf_for, monkeypatch):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setattr("api.amelia_media_extractor.extractor_available", lambda: True)
+
+    def _boom(url, dest_dir, *, filename_stem, timeout):
+        from api.amelia_media_extractor import ExtractorError
+        raise ExtractorError(f"yt-dlp failed to fetch {url}: unsupported URL")
+
+    monkeypatch.setattr("api.amelia_media_extractor.extract_media", _boom)
+    media_fixture.config.update(content_type="text/html", body=b"<html>a page</html>")
+    with pytest.raises(bots.ValidationError, match="unsupported URL"):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_extractor_fails")
+
+
+def test_fetch_media_page_url_extractor_success_over_cap_is_rejected(media_fixture, bypass_ssrf_for, monkeypatch, tmp_path):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setattr("api.amelia_media_extractor.extractor_available", lambda: True)
+    monkeypatch.setenv(bots.MEDIA_FETCH_MAX_BYTES_ENV, "5")
+
+    big_file = tmp_path / "downloaded.mp4"
+    big_file.write_bytes(b"x" * 1000)
+
+    def _fake_extract(url, dest_dir, *, filename_stem, timeout):
+        return {"path": str(big_file), "filename": big_file.name, "bytes": big_file.stat().st_size,
+                "mime": "video/mp4", "duration": 12.5}
+
+    monkeypatch.setattr("api.amelia_media_extractor.extract_media", _fake_extract)
+    media_fixture.config.update(content_type="text/html", body=b"<html>a page</html>")
+    with pytest.raises(bots.ValidationError, match="size cap"):
+        bots.fetch_media(media_fixture.url, filename=None, run_id="run_extractor_too_big")
+    assert not big_file.exists()  # over-cap output is deleted, not left behind
+
+
+def test_fetch_media_page_url_extractor_success_returns_duration(media_fixture, bypass_ssrf_for, monkeypatch, tmp_path):
+    bypass_ssrf_for("127.0.0.1", media_fixture.port)
+    monkeypatch.setattr("api.amelia_media_extractor.extractor_available", lambda: True)
+
+    small_file = tmp_path / "downloaded.mp4"
+    small_file.write_bytes(b"x" * 20)
+
+    def _fake_extract(url, dest_dir, *, filename_stem, timeout):
+        return {"path": str(small_file), "filename": small_file.name, "bytes": small_file.stat().st_size,
+                "mime": "video/mp4", "duration": 12.5}
+
+    monkeypatch.setattr("api.amelia_media_extractor.extract_media", _fake_extract)
+    media_fixture.config.update(content_type="text/html", body=b"<html>a page</html>")
+    result = bots.fetch_media(media_fixture.url, filename=None, run_id="run_extractor_ok")
+    assert result["duration"] == 12.5
+    assert result["bytes"] == 20
+
+
+# ── unit tests: media_fetch capability reporting ────────────────────────────
+
+def test_media_fetch_capability_reports_extractor_when_present(monkeypatch):
+    monkeypatch.setattr("api.amelia_media_extractor.extractor_available", lambda: True)
+    cap = bots.media_fetch_capability()
+    assert cap == {"direct": True, "extractor": "yt-dlp"}
+
+
+def test_media_fetch_capability_reports_none_when_absent(monkeypatch):
+    monkeypatch.setattr("api.amelia_media_extractor.extractor_available", lambda: False)
+    cap = bots.media_fetch_capability()
+    assert cap == {"direct": True, "extractor": None}
+
+
+def test_status_snapshot_includes_media_fetch_key(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(bots, "_STATE_PATH", pathlib.Path(tmp) / "state.json")
+        monkeypatch.setattr(bots, "_CAPACITY_PATH", pathlib.Path(tmp) / "capacity.json")
+        monkeypatch.setattr(bots, "discover_local_models", lambda: [])
+        monkeypatch.setattr("api.amelia_media_extractor.extractor_available", lambda: False)
+        snap = bots.status_snapshot()
+        assert snap["media_fetch"] == {"direct": True, "extractor": None}
+
+
+# ── unit tests: fetch_media tool wired into run_bot_steps ───────────────────
+
+def test_run_bot_steps_fetch_media_success_emits_attachment(monkeypatch):
+    monkeypatch.setenv("BOTS_FAKE_MODEL", "1")
+    fake_result = {"path": "/tmp/does-not-need-to-exist-for-this-part.mp3",
+                   "filename": "does-not-need-to-exist-for-this-part.mp3",
+                   "bytes": 123, "mime": "audio/mpeg"}
+    monkeypatch.setattr(bots, "fetch_media", lambda url, *, filename, run_id: fake_result)
+    monkeypatch.setattr(bots, "_sha256_file", lambda path: "deadbeef")
+    collector = _Collector()
+    req = {
+        "run_id": "r_media", "prompt": "[[fetch_media:https://example.com/video.mp4]]",
+        "posture": "balanced", "bot": {"id": "b1"}, "context": [], "model": None,
+    }
+    bots.run_bot_steps(req, collector)
+    attachments = [kw for kind, kw in collector.calls if kind == "attachment"]
+    assert len(attachments) == 1
+    assert attachments[0]["filename"] == fake_result["filename"]
+    assert attachments[0]["bytes"] == 123
+    assert attachments[0]["mime"] == "audio/mpeg"
+    assert attachments[0]["sha256"] == "deadbeef"
+    # fetch_media is never a risky action / approval_request.
+    assert not [kw for kind, kw in collector.calls if kind == "approval_request"]
+
+
+def test_run_bot_steps_fetch_media_failure_is_reported_not_raised(monkeypatch):
+    monkeypatch.setenv("BOTS_FAKE_MODEL", "1")
+
+    def _boom(url, *, filename, run_id):
+        raise bots.ValidationError("fetch_media refused: private network target")
+
+    monkeypatch.setattr(bots, "fetch_media", _boom)
+    collector = _Collector()
+    req = {
+        "run_id": "r_media_fail", "prompt": "[[fetch_media:http://127.0.0.1:1/x]]",
+        "posture": "balanced", "bot": {"id": "b1"}, "context": [], "model": None,
+    }
+    bots.run_bot_steps(req, collector)
+    attachments = [kw for kind, kw in collector.calls if kind == "attachment"]
+    assert attachments == []
+    events = [kw for kind, kw in collector.calls if kind == "event"]
+    assert any("fetch_media failed" in str(kw.get("body", "")) for kw in events)
+    done = [kw for kind, kw in collector.calls if kind == "done"]
+    assert done and done[0].get("error") is None  # a tool failure is reported, not a run crash
+
+
+def test_callback_emitter_includes_attachments_key_always(monkeypatch):
+    posted = []
+    monkeypatch.setattr(bots, "post_callback", lambda url, token, payload: posted.append(payload) or True)
+    emitter = bots._CallbackEmitter("http://x/cb", "tok", "run1")
+    emitter("event", kind="message", body="hi", data={})
+    assert "attachments" in posted[-1]
+    assert posted[-1]["attachments"] == []
+    emitter(
+        "attachment", filename="a.mp3", bytes=5, mime="audio/mpeg",
+        sha256="abc123", path="/tmp/a.mp3",
+    )
+    assert posted[-1]["attachments"] == [
+        {"filename": "a.mp3", "bytes": 5, "mime": "audio/mpeg", "sha256": "abc123", "path": "/tmp/a.mp3"},
+    ]
+    emitter("done", done=True)
+    # Attachments are cleared after each flush, same as events/tasks/approvals.
+    assert posted[-1]["attachments"] == []
+
+
+def test_run_bot_steps_fetch_media_attachment_reaches_a_real_callback_body(monkeypatch):
+    """End-to-end (real HTTP POST, real run_bot_steps, real _CallbackEmitter)
+    proof of the shape the server must consume: a successful fetch_media
+    step ends up as an entry in the POSTed body's `attachments` list, with
+    `done: true` still following it. fetch_media itself is monkeypatched
+    (network/SSRF behavior already has its own dedicated tests above) so
+    this test is only about the callback wiring."""
+    received = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            received.append(json.loads(self.rfile.read(n) or b"{}"))
+            resp = b'{"ok":true,"approvals":[]}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    port = srv.server_address[1]
+    try:
+        monkeypatch.setenv("BOTS_FAKE_MODEL", "1")
+        fake_result = {
+            "path": "/tmp/does-not-need-to-exist.mp4", "filename": "does-not-need-to-exist.mp4",
+            "bytes": 4096, "mime": "video/mp4",
+        }
+        monkeypatch.setattr(bots, "fetch_media", lambda url, *, filename, run_id: fake_result)
+        monkeypatch.setattr(bots, "_sha256_file", lambda path: "abc123sha")
+
+        emitter = bots._CallbackEmitter(f"http://127.0.0.1:{port}/cb", "tok-media", "run_media_cb")
+        req = {
+            "run_id": "run_media_cb", "prompt": "[[fetch_media:https://example.com/v.mp4]]",
+            "posture": "balanced", "bot": {"id": "b1"}, "context": [], "model": None,
+        }
+        bots.run_bot_steps(req, emitter)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    all_attachments = [a for body in received for a in body.get("attachments", [])]
+    assert len(all_attachments) == 1
+    attachment = all_attachments[0]
+    assert attachment == {
+        "filename": "does-not-need-to-exist.mp4", "bytes": 4096, "mime": "video/mp4",
+        "sha256": "abc123sha", "path": "/tmp/does-not-need-to-exist.mp4",
+    }
+    assert any(body.get("done") for body in received)
+
+
 # ── unit tests: local model discovery / posture ────────────────────────────
 
 @pytest.fixture(autouse=True)
@@ -849,6 +1277,13 @@ def test_status_reports_local_models_and_chosen_model_fields(bots_server):
     assert status == 200
     assert "local_models" in snap
     assert "chosen_model" in snap  # None is a valid value; the key must exist either way
+
+
+def test_status_reports_media_fetch_capability(bots_server):
+    status, snap = _get(bots_server, "/api/amelia/bots/status")
+    assert status == 200
+    assert snap["media_fetch"]["direct"] is True
+    assert snap["media_fetch"]["extractor"] in (None, "yt-dlp")
 
 
 def test_model_override_round_trips_through_status(bots_server):

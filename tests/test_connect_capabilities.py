@@ -107,3 +107,48 @@ def test_capabilities_ignores_a_non_integer_max_parallel():
     finally:
         srv.close()
     assert caps == {"bots": True}
+
+
+def test_capabilities_reports_media_fetch_when_present():
+    srv = _FakeLocalServer(200, {
+        "running": 0, "queued": 0, "local_models": [], "paused": False,
+        "media_fetch": {"direct": True, "extractor": "yt-dlp"},
+    })
+    try:
+        caps = connect.capabilities(srv.local)
+    finally:
+        srv.close()
+    assert caps == {"bots": True, "media_fetch": {"direct": True, "extractor": "yt-dlp"}}
+
+
+def test_capabilities_reports_media_fetch_with_no_extractor():
+    srv = _FakeLocalServer(200, {
+        "running": 0, "queued": 0, "local_models": [], "paused": False,
+        "media_fetch": {"direct": True, "extractor": None},
+    })
+    try:
+        caps = connect.capabilities(srv.local)
+    finally:
+        srv.close()
+    assert caps == {"bots": True, "media_fetch": {"direct": True, "extractor": None}}
+
+
+def test_capabilities_omits_media_fetch_when_absent_from_status():
+    """An older local server build without this key must not phantom-report
+    a capability — same "degrade gracefully" contract as max_parallel above."""
+    srv = _FakeLocalServer(200, {"running": 0, "queued": 0, "local_models": [], "paused": False})
+    try:
+        caps = connect.capabilities(srv.local)
+    finally:
+        srv.close()
+    assert caps == {"bots": True}
+    assert "media_fetch" not in caps
+
+
+def test_capabilities_ignores_a_non_dict_media_fetch():
+    srv = _FakeLocalServer(200, {"media_fetch": "nope"})
+    try:
+        caps = connect.capabilities(srv.local)
+    finally:
+        srv.close()
+    assert caps == {"bots": True}
