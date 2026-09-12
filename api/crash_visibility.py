@@ -21,6 +21,12 @@ is being fixed separately in #4765.  This module is purely about
 **diagnostics**: when the process dies we want a recorded reason, and one
 handler-thread exception must never disappear without a log line.
 
+Both hooks also call ``api.error_reporting.report_error`` (best-effort,
+no-op unless ``AMELIA_ERROR_URL`` is set) — the local log line is durable
+evidence for whoever is looking at THIS machine; the report is what makes
+that evidence visible to anyone who is not.
+
+
 Design constraints
 ------------------
 * Standard library only; no new dependencies.
@@ -127,11 +133,30 @@ def _emit(level: int, message: str, *, exc_info=None) -> None:
         pass
 
 
+def _report_uncaught(where: str, exc_value) -> None:
+    """Best-effort escalation of an uncaught exception past this process's own
+    log file — see api/error_reporting.py. A no-op unless AMELIA_ERROR_URL is
+    configured; never raises, so it can never become a second silent-death
+    mode inside a hook whose entire job is diagnosing the first one."""
+    if exc_value is None:
+        return
+    try:
+        from api.error_reporting import report_error
+        report_error(where, exc_value, {"surface": "desktop"})
+    except Exception:
+        pass
+
+
 def thread_excepthook(args) -> None:
-    """threading.excepthook: log any uncaught exception in a daemon/handler thread.
+    """Log AND report any uncaught exception in a daemon/handler thread.
 
     ``args`` is a ``threading.ExceptHookArgs`` (exc_type, exc_value,
     exc_traceback, thread). A normal thread shutdown may pass exc_type=None.
+
+    This is the process-wide backstop for "a background thread/async task
+    whose exception dies quietly": every uncaught exception on every daemon
+    thread — the bot runner's own pool included, on any path that manages to
+    escape its own try/except — passes through here exactly once.
     """
     try:
         exc_type = getattr(args, "exc_type", None)
@@ -153,6 +178,7 @@ def thread_excepthook(args) -> None:
             % (thread_name, thread_ident, daemon, getattr(exc_type, "__name__", exc_type)),
             exc_info=(exc_type, exc_value, exc_tb),
         )
+        _report_uncaught("thread:" + thread_name[:40], exc_value)
     except Exception:
         # A hook that raises would re-introduce the silent-death class of bug.
         try:
@@ -190,6 +216,7 @@ def main_excepthook(exc_type, exc_value, exc_tb) -> None:
             % (getattr(exc_type, "__name__", exc_type),),
             exc_info=(exc_type, exc_value, exc_tb),
         )
+        _report_uncaught("main-thread", exc_value)
     except Exception:
         try:
             _direct_write("[crash-visibility] main_excepthook failed to log an exception")
