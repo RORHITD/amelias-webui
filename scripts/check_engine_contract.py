@@ -41,6 +41,26 @@ The symbol list is DERIVED, never hardcoded. A hardcoded list rots silently the
 first time someone adds an import, and then reports "all clear" about a set that
 no longer matches reality.
 
+What this CANNOT see
+--------------------
+Only `import` statements. An attribute reached off an object is invisible to it:
+
+    assistant_message, _ = agent._normalize_codex_response(resp)
+
+`agent` is an `AIAgent` instance, so nothing about that line looks like a
+dependency on the engine's source — but it is one, and on engine 0.20.5
+`hasattr(AIAgent, "_normalize_codex_response")` is **False**, so it raises
+AttributeError. Found by upstream (nesquena/hermes-webui#7402) in the same area
+this guard found `normalize_anthropic_response`, and this guard would never have
+found it.
+
+Closing that gap properly means resolving what `agent` is bound to, which is
+type inference, not a grep — and a heuristic that flags every `x._private()`
+would drown the real findings. So it stays a stated limitation rather than a
+noisy half-measure: **an import check bounds one failure class, not all of
+them.** If you are auditing this area by hand, attribute access is where to
+look next.
+
 Usage
 -----
     python3 scripts/check_engine_contract.py
